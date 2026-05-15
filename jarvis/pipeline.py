@@ -37,6 +37,15 @@ from jarvis.tts import build_tts
 
 WORKSPACE = Path(__file__).parent.parent / "workspace"
 
+# User's existing Claude Code auto-memory pool (built up over normal monorepo
+# sessions). Read-only context for Jarvis — the persona prompt in
+# workspace/CLAUDE.md tells the model not to write here. Jarvis writes its
+# own session memory to ~/.claude/projects/-Users-ss-Code-jarvis-workspace/
+# automatically (separate pool, managed by Claude Code's auto-memory).
+USER_MEMORY_DIR = (
+    Path.home() / ".claude" / "projects" / "-Users-ss-Code-monorepo" / "memory"
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -91,7 +100,14 @@ async def run() -> None:
 
     stt = build_stt()
     log.info("STT provider: %s", type(stt).__name__)
-    llm = ClaudeCodeLLMService(workspace=WORKSPACE)
+
+    # Surface the user's monorepo memory pool as read-only context if it
+    # exists locally; skip silently on machines where it doesn't.
+    extra_dirs = [USER_MEMORY_DIR] if USER_MEMORY_DIR.is_dir() else []
+    if extra_dirs:
+        log.info("Mounting user memory: %s", USER_MEMORY_DIR)
+    llm = ClaudeCodeLLMService(workspace=WORKSPACE, add_dirs=extra_dirs)
+
     tts = build_tts()
     log.info("TTS provider: %s", type(tts).__name__)
 

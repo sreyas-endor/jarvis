@@ -48,7 +48,21 @@ from .streaming import ClaudeStreamingProcess
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TOOLS: list[str] = ["Read"]  # --tools "Read" -> file reading only
+# File + shell + agent tools. Deliberately excludes WebFetch/WebSearch and
+# MCP — those add network egress or unknown third-party side effects that
+# can't be confirmed before execution (voice permission prompts are not
+# yet wired; every listed tool auto-runs).
+DEFAULT_TOOLS: list[str] = [
+    "Read",
+    "Glob",
+    "Grep",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "Bash",
+    "Task",
+    "TodoWrite",
+]
 
 
 class ClaudeCodeLLMService(LLMService):
@@ -56,8 +70,9 @@ class ClaudeCodeLLMService(LLMService):
         self,
         *,
         workspace: Path,
-        model: str = "claude-haiku-4-5",
+        model: str = "claude-sonnet-4-6",
         tools: list[str] | None = None,
+        add_dirs: list[Path] | None = None,
     ) -> None:
         # Claude Code owns generation parameters (model, temperature, system prompt, etc.)
         # via CLI flags and its own CLAUDE.md, so we surface only the model name to Pipecat
@@ -80,6 +95,7 @@ class ClaudeCodeLLMService(LLMService):
             model=model,
             workspace=workspace,
             tools=tools if tools is not None else DEFAULT_TOOLS,
+            add_dirs=add_dirs,
         )
         self._started = False
         self._event_task: asyncio.Task | None = None
