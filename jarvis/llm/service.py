@@ -37,7 +37,6 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import LLMService
 from pipecat.services.settings import LLMSettings
 
-from .claude_streaming import ClaudeStreamingProcess
 from .event_bridge import (
     PermissionRequest,
     ToolUseStart,
@@ -45,6 +44,7 @@ from .event_bridge import (
     events_to_frames,
 )
 from .ndjson_parser import parse_line
+from .streaming import ClaudeStreamingProcess
 
 log = logging.getLogger(__name__)
 
