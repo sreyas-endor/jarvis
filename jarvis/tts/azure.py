@@ -1,4 +1,4 @@
-"""Azure Speech TTS — Ava Multilingual Neural with friendly style."""
+"""Azure Speech TTS — Ava Multilingual Neural."""
 from __future__ import annotations
 
 import os
@@ -11,16 +11,6 @@ from jarvis._util import require_env
 # Aria/Jenny/Sara line. Ava is widely regarded as Azure's most natural
 # conversational female.
 DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
-# Tuned to approximate Cartesia Skylar's character: warm/approachable
-# customer-care female. We push style intensity but keep pitch at default —
-# Ava's natural range is already on the higher side; lifting it reads
-# squeaky.
-#   style="friendly"      — warmer than "chat" (casual) or "customerservice" (polished)
-#   style_degree=1.5      — push expressivity (1.0=neutral, 2.0=max)
-#   pitch=None            — no prosody pitch shift; override via AZURE_SPEECH_PITCH
-DEFAULT_STYLE = "friendly"
-DEFAULT_STYLE_DEGREE = "1.5"
-DEFAULT_PITCH: str | None = None
 
 
 def build_azure_tts() -> AzureTTSService:
@@ -30,9 +20,7 @@ def build_azure_tts() -> AzureTTSService:
         settings=AzureTTSService.Settings(
             voice=os.environ.get("AZURE_SPEECH_VOICE", DEFAULT_VOICE),
             language="en-US",
-            style=os.environ.get("AZURE_SPEECH_STYLE", DEFAULT_STYLE),
-            style_degree=os.environ.get("AZURE_SPEECH_STYLE_DEGREE", DEFAULT_STYLE_DEGREE),
-            pitch=os.environ.get("AZURE_SPEECH_PITCH", DEFAULT_PITCH),
+            pitch=os.environ.get("AZURE_SPEECH_PITCH"),
             rate=os.environ.get("AZURE_SPEECH_RATE"),
         ),
     )

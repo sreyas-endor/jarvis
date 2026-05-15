@@ -23,3 +23,26 @@ WHISPER_INITIAL_PROMPT = (
     "This is a casual conversation with a developer. Common terms include "
     + ", ".join(JARGON_PHRASES) + "."
 )
+
+# Curated subset for Deepgram Nova-3's `keyterm` runtime biasing. Deepgram
+# docs warn accuracy degrades past ~30-50 keyterms (overfitting), so this
+# is intentionally focused on the highest-leverage terms — file extensions
+# the user actually says ("dot go", ".go"), Endor-specific identifiers,
+# and project nouns that Azure regularly fumbles. Keep ordering by
+# perceived importance; Deepgram may use position as a soft signal.
+DEEPGRAM_KEYTERMS = [
+    # File extensions — most common STT failure mode (period gets dropped)
+    ".go", ".py", ".ts", ".tsx", ".proto", ".yaml", ".json", ".md",
+    "dot go", "dot py", "dot ts", "dot proto",
+    # Endor-specific identifiers heard often
+    "endorctl", "Endor Labs", "monorepo",
+    "datawarehouseserver", "exporter",
+    # Tooling user touches daily
+    "Pipecat", "Cartesia", "Anthropic", "Claude Code",
+    "Bazel", "BigQuery", "protobuf",
+    # Programming languages
+    "Go", "Python", "TypeScript",
+    # Cloud / infra terms that often get mangled
+    "Kubernetes", "ArgoCD", "Terraform", "GitHub Actions",
+    "kubectl", "helm",
+]

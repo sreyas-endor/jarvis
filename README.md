@@ -89,7 +89,7 @@ its own constants (voice IDs, instructions, deployment names). The
 | Provider | File | Voice / model |
 |---|---|---|
 | `cartesia` | `cartesia.py` | Sonic-3 + Skylar (`db6b0ed5-d5d3-463d-ae85-518a07d3c2b4`). Best naturalness. |
-| `azure` | `azure.py` | `en-US-AvaMultilingualNeural` with `style=friendly`, `style_degree=1.5`, no pitch shift. |
+| `azure` | `azure.py` | `en-US-AvaMultilingualNeural`, no style/expressivity wrapper (faster first-byte than styled neural). |
 | `openai` | `azure_openai.py` | `gpt-4o-mini-tts` via Azure AI Foundry. `OpenAITTSService` subclass swapping `AsyncOpenAI` → `AsyncAzureOpenAI`. Default voice `fable` + short persona-anchored instructions. |
 | `mai` | `mai.py` | Microsoft MAI-Voice-1 (`en-US-June:MAI-Voice-1`). Uses the regular Azure Speech SDK — only the voice name format differs. |
 
@@ -153,8 +153,6 @@ inline (`TTS_PROVIDER=azure uv run python main.py`).
 | `AZURE_SPEECH_KEY` | — | Required for `azure` STT and for `azure` / `mai` TTS |
 | `AZURE_SPEECH_REGION` | — | e.g. `eastus` |
 | `AZURE_SPEECH_VOICE` | `en-US-AvaMultilingualNeural` | Azure TTS only |
-| `AZURE_SPEECH_STYLE` | `friendly` | Azure TTS only |
-| `AZURE_SPEECH_STYLE_DEGREE` | `1.5` | Azure TTS only |
 | `AZURE_SPEECH_PITCH` | unset | Azure TTS only |
 | `AZURE_SPEECH_RATE` | unset | Azure TTS only |
 | `MAI_VOICE` | `en-US-June:MAI-Voice-1` | MAI TTS only |
