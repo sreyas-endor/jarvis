@@ -53,11 +53,9 @@ A standard [Pipecat](https://github.com/pipecat-ai/pipecat) pipeline:
 | File | Role |
 |---|---|
 | `claude_code_llm_service.py` | Pipecat `LLMService` driving Claude Code. Owns barge-in (`_suppress_text_until_next_send`, `_awaiting_response`), forwards transcriptions, and pushes `InterruptionFrame` on VAD start so TTS flushes mid-sentence. |
-| `claude_streaming.py` | One long-running `claude -p --input-format stream-json` subprocess. Reuses the process across turns (~1–1.5s/turn warm vs ~6s cold). 10MB stdout buffer because tool results can exceed the asyncio readline default. |
-| `claude_subprocess.py` | Per-turn spawn variant (kept as reference; not currently wired). |
+| `claude_streaming.py` | One long-running `claude -p --input-format stream-json` subprocess. Reuses the process across turns (~1–1.5s/turn warm vs ~6s cold). 10MB stdout buffer because tool results can exceed the asyncio readline default. Generates a per-conversation session UUID inline. |
 | `event_bridge.py` | Translates Claude Code's NDJSON stream events into Pipecat frames (`LLMTextFrame`, `LLMFullResponseStartFrame`, `LLMFullResponseEndFrame`) plus internal items (`ToolUseStart`, `PermissionRequest`, `TurnComplete`). |
 | `ndjson_parser.py` | Defensive line-by-line JSON parser. Drops non-JSON noise rather than crashing. |
-| `session_manager.py` | UUID-based session tracker for `--session-id` / `--resume`. |
 
 ### STT services
 
@@ -78,7 +76,6 @@ have selected.
 | `azure` | (built-in `AzureTTSService`) | `en-US-AvaMultilingualNeural` with `style=friendly`, `style_degree=1.5`, no pitch shift. |
 | `openai` | `azure_openai_tts_service.py` | `gpt-4o-mini-tts` via Azure AI Foundry. `OpenAITTSService` subclass swapping `AsyncOpenAI` → `AsyncAzureOpenAI`. Default voice `fable` + short persona-anchored instructions. |
 | `mai` | (built-in `AzureTTSService`) | Microsoft MAI-Voice-1 (`en-US-June:MAI-Voice-1`). Uses the regular Azure Speech SDK — only the voice name format differs. |
-| `csm` (unwired) | `csm_tts_service.py` | Local CSM-1B with 4-bit MLX quantization. Voice anchored via `Segment` context on `assets/voice_reference.wav`. Kept as fallback; broke in live pipeline despite clean offline WAVs. |
 
 ### Voice persona
 
@@ -250,23 +247,18 @@ patch is a no-op.
 jarvis/
 ├── main.py                              # Pipeline entry + provider factories
 ├── check_mic.py                         # OS-level mic sanity check
+├── debug_audio.py                       # Pipecat audio-input debugger
 ├── jarvis/                              # Python package
 │   ├── claude_code_llm_service.py       # Pipecat LLMService → Claude Code
 │   ├── claude_streaming.py              # Long-running `claude -p` subprocess
-│   ├── claude_subprocess.py             # Per-turn spawn (reference)
 │   ├── event_bridge.py                  # Claude NDJSON → Pipecat frames
 │   ├── ndjson_parser.py                 # Defensive line parser
-│   ├── session_manager.py               # UUID session for --session-id / --resume
 │   ├── azure_phraselist_stt_service.py  # Azure STT + jargon phrase list
 │   ├── whisper_jargon_stt_service.py    # Whisper MLX + initial_prompt
-│   ├── azure_openai_tts_service.py      # OpenAI TTS via Azure Foundry
-│   └── csm_tts_service.py               # CSM-1B local (unwired fallback)
+│   └── azure_openai_tts_service.py      # OpenAI TTS via Azure Foundry
 ├── workspace/
 │   └── CLAUDE.md                        # Voice persona system prompt
-├── assets/
-│   └── voice_reference.wav              # CSM voice anchor (5-10s reference)
-├── csm_*.py, orpheus_voice_scan.py      # Standalone TTS research scripts
-├── debug_audio.py                       # Pipecat audio-input debugger
+├── csm_*.py, orpheus_voice_scan.py      # Standalone TTS research scripts (historical)
 ├── pyproject.toml                       # uv / hatch project config
 └── uv.lock                              # Locked deps
 ```
@@ -302,9 +294,6 @@ provider supports any form of vocabulary biasing.
 
 ## Known issues / next steps
 
-- **CSM live-pipeline audio breaks.** Offline WAVs clean, live pipeline
-  garbled. Suspected per-chunk resampling at mismatched sample rates;
-  not isolated. Kept as importable fallback.
 - **MAI-Voice-1 untested end-to-end.** Wired but not yet exercised. First
   failure mode to expect: region mismatch (provision Azure Speech in a
   MAI-supported region).
@@ -321,5 +310,4 @@ provider supports any form of vocabulary biasing.
 - [Pipecat](https://github.com/pipecat-ai/pipecat) — pipeline framework
 - [Cartesia](https://cartesia.ai/) — Sonic-3 / Skylar
 - [Whisper MLX](https://github.com/ml-explore/mlx-examples) — local STT on Apple Silicon
-- [csm-mlx](https://github.com/senstella/csm-mlx) — CSM-1B port
 - [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) — the brain

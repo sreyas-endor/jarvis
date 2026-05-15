@@ -76,14 +76,10 @@ class ClaudeCodeLLMService(LLMService):
             user_turn_completion_config=None,
         )
         super().__init__(settings=settings)
-        self._workspace = workspace
-        self._model = model
-        self._tools = tools if tools is not None else DEFAULT_TOOLS
-
         self._proc = ClaudeStreamingProcess(
             model=model,
             workspace=workspace,
-            tools=self._tools,
+            tools=tools if tools is not None else DEFAULT_TOOLS,
         )
         self._started = False
         self._event_task: asyncio.Task | None = None

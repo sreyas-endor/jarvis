@@ -1,11 +1,8 @@
-"""Local-only Jarvis spike — mic in, Claude Code as brain, voice out.
+"""Jarvis voice agent — mic in, Claude Code as brain, voice out.
 
-Runs entirely on-device after first launch:
-  STT: Whisper MLX (Apple Silicon-accelerated)
-  TTS: Kokoro (auto-downloads on first run)
-  LLM: `claude` CLI on your subscription
-
-No API keys required. First launch downloads models — expect a slow start.
+Pipeline: LocalAudioTransport → VAD → STT → ClaudeCodeLLMService → TTS →
+EventLogger → LocalAudioTransport. STT and TTS providers are swappable
+via STT_PROVIDER and TTS_PROVIDER env vars; see README for the matrix.
 
 Run with AirPods or wired headphones to avoid the laptop-speaker echo loop.
 """
@@ -46,7 +43,6 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     Frame,
     LLMTextFrame,
-    OutputAudioRawFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -61,7 +57,6 @@ from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.azure.tts import AzureTTSService
 from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.kokoro.tts import KokoroTTSService  # noqa: F401 — kept as fallback
 from pipecat.services.whisper.stt import MLXModel, WhisperMLXSTTSettings
 from pipecat.transcriptions.language import Language
 from pipecat.transports.local.audio import (
@@ -72,7 +67,6 @@ from pipecat.transports.local.audio import (
 from jarvis.azure_openai_tts_service import AzureOpenAITTSService
 from jarvis.azure_phraselist_stt_service import AzurePhraseListSTTService
 from jarvis.claude_code_llm_service import ClaudeCodeLLMService
-from jarvis.csm_tts_service import CsmTtsService  # noqa: F401 — kept as fallback
 from jarvis.whisper_jargon_stt_service import WhisperJargonSTTService
 
 # Cartesia "Skylar - Friendly Guide" voice (resolved from
@@ -255,9 +249,7 @@ class EventLogger(FrameProcessor):
 
     def __init__(self) -> None:
         super().__init__()
-        self._claude_text = ""
         self._tts_audio_bytes = 0
-        self._out_audio_bytes = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -268,7 +260,6 @@ class EventLogger(FrameProcessor):
         elif isinstance(frame, TranscriptionFrame):
             print(f"    you: {frame.text.strip()!r}")
         elif isinstance(frame, LLMTextFrame):
-            self._claude_text += frame.text
             print(f"    claude: {frame.text!r}")
         elif isinstance(frame, TTSStartedFrame):
             self._tts_audio_bytes = 0
@@ -277,8 +268,6 @@ class EventLogger(FrameProcessor):
             print(f"    [tts stopped — synthesized {self._tts_audio_bytes} audio bytes]")
         elif isinstance(frame, TTSAudioRawFrame):
             self._tts_audio_bytes += len(frame.audio)
-        elif isinstance(frame, OutputAudioRawFrame):
-            self._out_audio_bytes += len(frame.audio)
         await self.push_frame(frame, direction)
 
 WORKSPACE = Path(__file__).parent / "workspace"
@@ -310,18 +299,9 @@ async def main() -> None:
         )
     )
 
-    # First-run cost: Whisper turbo ~1.5GB, Kokoro ~150MB.
-    # For faster dev iteration swap LARGE_V3_TURBO_Q4 -> TINY.
-    # For cloud-quality voice later: WhisperSTTServiceMLX -> DeepgramSTTService,
-    # KokoroTTSService -> CartesiaTTSService (both need API keys).
     stt = _build_stt()
     logging.info("STT provider: %s", type(stt).__name__)
     llm = ClaudeCodeLLMService(workspace=WORKSPACE)
-    # Fallbacks (uncomment to revert):
-    # tts = KokoroTTSService(
-    #     settings=KokoroTTSService.Settings(voice="bm_george", language=Language.EN)
-    # )
-    # tts = CsmTtsService()
     tts = _build_tts()
     logging.info("TTS provider: %s", type(tts).__name__)
 
