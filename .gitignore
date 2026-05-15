@@ -1,0 +1,35 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+*.egg-info/
+build/
+dist/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated / scratch audio
+*.wav
+!assets/voice_reference.wav
+
+# Logs
+*.log
+
+# Model cache (Hugging Face / MLX downloads go to ~/.cache by default; ignore any local strays)
+.cache/
+.huggingface/
+.mlx-cache/
