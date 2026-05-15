@@ -258,7 +258,7 @@ jarvis/
 │   └── azure_openai_tts_service.py      # OpenAI TTS via Azure Foundry
 ├── workspace/
 │   └── CLAUDE.md                        # Voice persona system prompt
-├── csm_*.py, orpheus_voice_scan.py      # Standalone TTS research scripts (historical)
+├── csm_*.py                             # Standalone TTS research scripts (historical)
 ├── pyproject.toml                       # uv / hatch project config
 └── uv.lock                              # Locked deps
 ```
