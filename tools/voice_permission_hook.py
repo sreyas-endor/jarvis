@@ -39,6 +39,14 @@ HARD_DENY_PATTERNS: list[str] = [
     r"\b(curl|wget)\s+[^|]*\|\s*(bash|sh)\b",  # pipe-to-shell from network
 ]
 
+# Bash commands that always run without a voice prompt — jarvis's own
+# housekeeping CLI for session management. The match is loose on
+# purpose: any invocation that mentions tools/jarvis_cli.py qualifies,
+# even with `uv run` / `python` prefixes.
+AUTO_ALLOW_BASH_PATTERNS: list[str] = [
+    r"\btools/jarvis_cli\.py\b",
+]
+
 
 def _hard_deny(tool: str, args: dict) -> str | None:
     if tool != "Bash":
@@ -48,6 +56,14 @@ def _hard_deny(tool: str, args: dict) -> str | None:
         if re.search(pat, cmd):
             return f"static blocklist match: {pat}"
     return None
+
+
+def _auto_allow(tool: str, args: dict) -> bool:
+    """Skip the voice prompt for known-safe internal CLI commands."""
+    if tool != "Bash":
+        return False
+    cmd = (args.get("command") or "").strip()
+    return any(re.search(pat, cmd) for pat in AUTO_ALLOW_BASH_PATTERNS)
 
 
 def main() -> None:
@@ -64,6 +80,9 @@ def main() -> None:
     if hard is not None:
         print(f"refused: {hard}", file=sys.stderr)
         sys.exit(2)
+
+    if _auto_allow(tool, args):
+        sys.exit(0)
 
     body = json.dumps({"tool": tool, "args": args}).encode("utf-8")
     req = urllib.request.Request(

@@ -60,6 +60,11 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from jarvis.llm.service import ClaudeCodeLLMService
 from jarvis.pipeline import build_pipeline_task
+from jarvis.sessions import (
+    NarrationEvent,
+    SessionRegistry,
+    discover_sessions,
+)
 
 # Bind 0.0.0.0 so the iPhone (over Tailscale or LAN) can reach us — Tailscale
 # will expose the port on the tailnet IP.
@@ -98,6 +103,9 @@ async def _run_pipeline_for_connection(connection: SmallWebRTCConnection) -> Non
         # installing its own would steal Ctrl-C from the server process.
         await PipelineRunner(handle_sigint=False).run(task)
     finally:
+        # Drop any attached session tailers so we don't keep narrating
+        # into a dead pipeline after hang-up.
+        await _session_registry.detach_all()
         log.info("pipeline finished pc_id=%s", connection.pc_id)
 
 
@@ -109,6 +117,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 _request_handler = SmallWebRTCRequestHandler()
+
+
+# Session registry. Lives across calls (each call rebinds the on_event
+# callback to the new active service via _narrate). detach_all() runs on
+# call teardown so we don't keep tailing into a dead pipeline.
+async def _narrate(event: NarrationEvent) -> None:
+    svc = ClaudeCodeLLMService.active_instance()
+    if svc is None:
+        return
+    # Use the session id's leading 4 hex chars so we have *some* handle to
+    # disambiguate in voice without reading out a full UUID.
+    label = event.session_id[:4]
+    await svc.speak_narration(f"session {label}: {event.summary}")
+
+
+_session_registry = SessionRegistry(on_event=_narrate)
 
 
 @app.get("/health")
@@ -131,6 +155,53 @@ async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
 async def offer_patch(request: SmallWebRTCPatchRequest):
     await _request_handler.handle_patch_request(request)
     return {"status": "success"}
+
+
+@app.get("/internal/sessions")
+async def list_sessions(exclude: str | None = None) -> dict:
+    """List recent sessions on disk. Used by tools/jarvis_cli.py list.
+
+    ``exclude`` lets the master session skip itself in the listing — it
+    knows its own session id and passes it here.
+    """
+    sessions = discover_sessions(exclude_session_id=exclude)
+    return {
+        "sessions": [
+            {
+                "id": s.session_id,
+                "project": s.project_dir,
+                "last_modified": s.last_modified,
+                "summary": s.first_user_message,
+            }
+            for s in sessions
+        ],
+        "attached": _session_registry.attached_ids,
+    }
+
+
+@app.post("/internal/sessions/attach")
+async def attach_session(body: dict) -> dict:
+    session_id = (body.get("session_id") or "").strip()
+    if not session_id:
+        return {"ok": False, "error": "missing session_id"}
+    info = await _session_registry.attach(session_id)
+    if info is None:
+        return {"ok": False, "error": f"session {session_id} not found"}
+    return {
+        "ok": True,
+        "session_id": info.session_id,
+        "project": info.project_dir,
+        "summary": info.first_user_message,
+    }
+
+
+@app.post("/internal/sessions/detach")
+async def detach_session(body: dict) -> dict:
+    session_id = (body.get("session_id") or "").strip()
+    if not session_id:
+        return {"ok": False, "error": "missing session_id"}
+    ok = await _session_registry.detach(session_id)
+    return {"ok": ok}
 
 
 @app.post("/internal/permission")

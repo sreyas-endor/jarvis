@@ -416,6 +416,23 @@ class ClaudeCodeLLMService(LLMService):
         except Exception:
             log.exception("heartbeat loop crashed")
 
+    async def speak_narration(self, text: str) -> None:
+        """Push a session-tail narration line into the call.
+
+        Skipped when the user is mid-utterance — barge-in already silenced
+        TTS and we don't want to step on the user's next sentence with
+        background narration.
+        """
+        if self._suppress_text_until_next_send:
+            return
+        if (
+            self._pending_permission_future is not None
+            and not self._pending_permission_future.done()
+        ):
+            # Don't interrupt a permission prompt.
+            return
+        await self.push_frame(TTSSpeakFrame(text=text, append_to_context=False))
+
     async def request_permission_voice(self, *, tool: str, args: dict) -> dict:
         """Speak a permission prompt and wait for a yes/no.
 
