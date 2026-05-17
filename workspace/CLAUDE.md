@@ -39,15 +39,31 @@ A handful of catastrophic commands (rm -rf /, fork bomb, dd to /dev/, curl|sh) a
 
 ## Other Claude Code sessions on this Mac
 
-The user runs Claude Code in regular terminals too. You can list those sessions and attach to one so its major events (tool calls, errors, completions, new user messages) get narrated to the user mid-call. Read-only — you can observe, not inject input.
+You have two distinct levers for working with other Claude Code sessions.
 
-Use `tools/jarvis_cli.py` (no voice prompt; auto-allowed):
+### 1. Workers — Jarvis-owned tmux sessions you fully control
 
-- `uv run --project $JARVIS_HOME python $JARVIS_HOME/tools/jarvis_cli.py sessions list` — see what's running. Each row shows a short id, age, project path, and the first user message so you know what the session is about.
-- `uv run --project $JARVIS_HOME python $JARVIS_HOME/tools/jarvis_cli.py sessions attach <id-prefix>` — start narrating. Eight-char prefix is enough if it's unique.
-- `uv run --project $JARVIS_HOME python $JARVIS_HOME/tools/jarvis_cli.py sessions detach <id-prefix>` — stop.
+Spawn dedicated Claude workers in tmux when the user wants you to start work somewhere. You can talk to them by voice, the user can attach to the same tmux session from iTerm and watch (or type), and you can hand control back and forth.
 
-When the user says things like "check what my other session is doing", "what's happening in the auth session", or "attach to my deploy work", that's your cue to list and attach. Read the list back to the user in voice prose (don't recite UUIDs) and let them pick.
+All `jarvis-cli` commands run via Bash and don't trigger the voice permission prompt — they're auto-allowed. Shell prefix throughout: `uv run --project $JARVIS_HOME python $JARVIS_HOME/tools/jarvis_cli.py`.
+
+- `worker spawn <name> [--cwd <dir>] [--prompt <initial msg>]` — start a new worker. Name should be a short label (e.g. `auth`, `deploy`, `refactor`). The user can run `tmux attach -t jarvis-<name>` to view it live in iTerm; that command is printed in the response. The `--cwd` is where claude runs — ask the user which directory if it's not obvious from context. `--prompt` is typed in automatically right after launch.
+- `worker list` — show running workers, their working directories, and which one is currently focused.
+- `worker focus <name>` — route the user's voice straight to that worker. Useful when they say "okay, talk to the auth worker for me". After focus, you stay silent on the master side; the user's transcribed speech goes into the worker's tmux pane. The user can pull back with phrases like "hey jarvis" or "unfocus" or by you running `worker unfocus`.
+- `worker send <name> "<text>"` — inject a single message into a worker without flipping focus. Useful for status pokes ("are you done yet?").
+- `worker kill <name>` — terminate.
+
+When the user says things like "spin up a session in the monorepo to fix the auth bug", that's: `worker spawn auth --cwd ~/projects/monorepo --prompt "fix the auth bug — start by reading auth.go"`. Then tell them how to attach if they want to watch.
+
+### 2. External sessions — read-only narration of other terminals
+
+For Claude sessions the user started themselves outside of Jarvis (in iTerm directly), you can tail their transcripts and narrate major events into the call. Read-only — you can observe, not inject. Same CLI:
+
+- `sessions list` — every Claude session on disk, recent first. Includes Jarvis workers and external sessions.
+- `sessions attach <id-prefix>` — start narrating that session's major events (tool calls, completions, errors).
+- `sessions detach <id-prefix>` — stop narrating.
+
+When the user says "what's happening in my other session?" or "watch the deploy work", attach there. Read the list back as prose ("you've got one in monorepo from twenty minutes ago, one in toolbox from this morning…"), not UUIDs.
 
 ## Memory
 

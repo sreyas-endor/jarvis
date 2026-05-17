@@ -124,6 +124,101 @@ def cmd_sessions_detach(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_worker_spawn(args: argparse.Namespace) -> int:
+    body: dict = {"name": args.name}
+    if args.cwd:
+        body["cwd"] = args.cwd
+    if args.prompt:
+        body["prompt"] = args.prompt
+    try:
+        payload = _http_post("/internal/worker/spawn", body)
+    except urllib.error.URLError as e:
+        print(f"error: pipecat unreachable ({e.reason})", file=sys.stderr)
+        return 1
+    if not payload.get("ok"):
+        print(f"error: {payload.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    print(
+        f"Spawned worker '{payload['name']}' in {payload['cwd']}.\n"
+        f"  attach with: {payload['attach_cmd']}"
+    )
+    return 0
+
+
+def cmd_worker_list(_args: argparse.Namespace) -> int:
+    try:
+        payload = _http_get("/internal/worker/list")
+    except urllib.error.URLError as e:
+        print(f"error: pipecat unreachable ({e.reason})", file=sys.stderr)
+        return 1
+    workers = payload.get("workers", [])
+    focused = payload.get("focused")
+    if not workers:
+        print("No Jarvis workers running.")
+        return 0
+    print(f"{len(workers)} worker(s):")
+    for w in workers:
+        marker = " [focused]" if w["name"] == focused else ""
+        live = "alive" if w["alive"] else "dead"
+        print(f"  {w['name']:<20} {live:<5}  {w['cwd']}{marker}")
+        print(f"      attach: {w['attach_cmd']}")
+    return 0
+
+
+def cmd_worker_send(args: argparse.Namespace) -> int:
+    try:
+        payload = _http_post(
+            "/internal/worker/send", {"name": args.name, "text": args.text}
+        )
+    except urllib.error.URLError as e:
+        print(f"error: pipecat unreachable ({e.reason})", file=sys.stderr)
+        return 1
+    if payload.get("ok"):
+        print(f"Sent to {args.name}.")
+        return 0
+    print(f"error: send failed (worker not found or dead)", file=sys.stderr)
+    return 1
+
+
+def cmd_worker_kill(args: argparse.Namespace) -> int:
+    try:
+        payload = _http_post("/internal/worker/kill", {"name": args.name})
+    except urllib.error.URLError as e:
+        print(f"error: pipecat unreachable ({e.reason})", file=sys.stderr)
+        return 1
+    if payload.get("ok"):
+        print(f"Killed worker {args.name}.")
+        return 0
+    print(f"error: kill failed", file=sys.stderr)
+    return 1
+
+
+def cmd_worker_focus(args: argparse.Namespace) -> int:
+    try:
+        payload = _http_post(
+            "/internal/worker/focus", {"name": args.name or ""}
+        )
+    except urllib.error.URLError as e:
+        print(f"error: pipecat unreachable ({e.reason})", file=sys.stderr)
+        return 1
+    if not payload.get("ok"):
+        print(f"error: {payload.get('error', 'unknown')}", file=sys.stderr)
+        return 1
+    focused = payload.get("focused")
+    if focused:
+        print(
+            f"Focused on '{focused}'. The user's voice now goes to that "
+            f"worker until they say 'hey jarvis' or 'unfocus'."
+        )
+    else:
+        print("Unfocused. Voice is back with the master.")
+    return 0
+
+
+def cmd_worker_unfocus(_args: argparse.Namespace) -> int:
+    return cmd_worker_focus(argparse.Namespace(name=""))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="jarvis-cli")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -146,6 +241,51 @@ def main() -> int:
     p_detach = sessions_sub.add_parser("detach", help="stop narrating a session")
     p_detach.add_argument("session_id")
     p_detach.set_defaults(func=cmd_sessions_detach)
+
+    worker = sub.add_parser(
+        "worker", help="spawn and control Jarvis-owned Claude workers in tmux"
+    )
+    worker_sub = worker.add_subparsers(dest="action", required=True)
+
+    w_spawn = worker_sub.add_parser(
+        "spawn",
+        help="start a new worker. user can attach via 'tmux attach -t jarvis-<name>'",
+    )
+    w_spawn.add_argument("name", help="short handle (jarvis-<name> becomes the tmux session)")
+    w_spawn.add_argument(
+        "--cwd",
+        default="",
+        help="working directory the worker runs in (default: current dir)",
+    )
+    w_spawn.add_argument(
+        "--prompt",
+        default="",
+        help="optional initial prompt typed into the worker on launch",
+    )
+    w_spawn.set_defaults(func=cmd_worker_spawn)
+
+    w_list = worker_sub.add_parser("list", help="list Jarvis-owned workers")
+    w_list.set_defaults(func=cmd_worker_list)
+
+    w_send = worker_sub.add_parser("send", help="inject one message into a worker")
+    w_send.add_argument("name")
+    w_send.add_argument("text")
+    w_send.set_defaults(func=cmd_worker_send)
+
+    w_kill = worker_sub.add_parser("kill", help="terminate a worker")
+    w_kill.add_argument("name")
+    w_kill.set_defaults(func=cmd_worker_kill)
+
+    w_focus = worker_sub.add_parser(
+        "focus", help="route the user's voice to a worker instead of the master"
+    )
+    w_focus.add_argument("name")
+    w_focus.set_defaults(func=cmd_worker_focus)
+
+    w_unfocus = worker_sub.add_parser(
+        "unfocus", help="pull voice routing back to the master"
+    )
+    w_unfocus.set_defaults(func=cmd_worker_unfocus)
 
     args = parser.parse_args()
     return args.func(args)

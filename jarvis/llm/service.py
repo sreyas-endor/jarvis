@@ -25,6 +25,7 @@ import asyncio
 import logging
 import random
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from pipecat.frames.frames import (
@@ -172,6 +173,19 @@ PERMISSION_VOICE_TIMEOUT_SECONDS: float = 45.0
 _YES_RE = r"^(yes|yeah|yep|yup|sure|go|do it|allow|approved?|okay|ok|fine)\b"
 _NO_RE = r"^(no|nope|nah|don'?t|deny|stop|cancel|negative|abort)\b"
 
+# When focused on a worker, these phrases route to the master instead so
+# the user can drop out of the worker without typing /unfocus. Kept
+# generous because STT mistakes ("hey jarvis" -> "hey jervis") happen.
+_UNFOCUS_PHRASES = [
+    r"^hey\s+jarvis\b",
+    r"^jarvis,?\b",
+    r"^back to jarvis\b",
+    r"^unfocus\b",
+    r"^stop talking to (it|the worker|that)\b",
+    r"^never mind\b",
+    r"^okay (back|jarvis)\b",
+]
+
 # Immediate acknowledgement spoken the moment we receive a transcription,
 # before claude has even seen the message. Cuts perceived latency: instead
 # of waiting ~2s in dead air for claude's TTFT + TTS startup, the user hears
@@ -258,6 +272,14 @@ class ClaudeCodeLLMService(LLMService):
         # to claude as a chat message.
         self._pending_permission_future: asyncio.Future[dict] | None = None
 
+        # Focus routing. When set, transcription gets injected into the
+        # named worker's tmux pane instead of forwarded to this master
+        # claude — lets the user talk *to* a worker, not just about it.
+        # The actual injection function is set by main.py (it depends on
+        # the WorkerManager singleton, which lives in the FastAPI process).
+        self._focused_worker: str | None = None
+        self._worker_input_sink: "Callable[[str, str], Awaitable[bool]] | None" = None
+
         type(self)._current_instance = self
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -293,6 +315,43 @@ class ClaudeCodeLLMService(LLMService):
                 self._suppress_text_until_next_send = False
                 await self._resolve_permission_reply(text)
                 return
+
+            # Focus routing. If a worker is focused, the user's voice
+            # goes to that worker's tmux pane via the configured sink,
+            # not to the master claude. An explicit unfocus phrase pulls
+            # the conversation back to the master.
+            if self._focused_worker is not None and self._worker_input_sink is not None:
+                lower = text.lower()
+                if any(re.match(p, lower) for p in _UNFOCUS_PHRASES):
+                    name = self._focused_worker
+                    self._focused_worker = None
+                    self._suppress_text_until_next_send = False
+                    await self.push_frame(
+                        TTSSpeakFrame(
+                            text=f"okay, back with you. {name} is still running.",
+                            append_to_context=False,
+                        )
+                    )
+                    return
+                self._suppress_text_until_next_send = False
+                ok = await self._worker_input_sink(self._focused_worker, text)
+                if ok:
+                    # Quiet acknowledgement so the user knows the line
+                    # was delivered. Don't TTS the whole message back —
+                    # the worker echoes that itself in its tmux pane.
+                    await self.push_frame(
+                        TTSSpeakFrame(text="sent", append_to_context=False)
+                    )
+                else:
+                    self._focused_worker = None
+                    await self.push_frame(
+                        TTSSpeakFrame(
+                            text="that worker isn't responding. back to me.",
+                            append_to_context=False,
+                        )
+                    )
+                return
+
             await self._ensure_started()
             self._suppress_text_until_next_send = False
             self._awaiting_response = True
@@ -416,6 +475,25 @@ class ClaudeCodeLLMService(LLMService):
         except Exception:
             log.exception("heartbeat loop crashed")
 
+    def set_worker_input_sink(
+        self, sink: Callable[[str, str], Awaitable[bool]]
+    ) -> None:
+        """Wire the function that delivers focused voice input to a worker.
+
+        Called from main.py at startup; the sink calls WorkerManager.send_input.
+        """
+        self._worker_input_sink = sink
+
+    def focus_worker(self, name: str) -> None:
+        self._focused_worker = name
+
+    def unfocus_worker(self) -> None:
+        self._focused_worker = None
+
+    @property
+    def focused_worker(self) -> str | None:
+        return self._focused_worker
+
     async def speak_narration(self, text: str) -> None:
         """Push a session-tail narration line into the call.
 
@@ -516,14 +594,37 @@ class ClaudeCodeLLMService(LLMService):
             verb = "edit" if tool in ("Edit", "MultiEdit") else "write to"
             return f"I want to {verb} {self._friendly_path(target)}. Okay?"
         if tool == "Bash":
-            cmd = (args.get("command") or "").strip()
-            if len(cmd) > 100:
-                cmd = cmd[:97] + "…"
-            return f"I want to run: {cmd}. Okay?"
+            cmd = self._voice_clean_command(args.get("command") or "")
+            return f"I want to run: {cmd}. Okay?" if cmd else "I want to run a shell command. Okay?"
         if tool == "Task":
             description = args.get("description") or "a subtask"
             return f"I want to spin up a subagent for {description}. Okay?"
         return f"I want to use the {tool} tool. Okay?"
+
+    @staticmethod
+    def _voice_clean_command(cmd: str) -> str:
+        """Strip shell metacharacters that confuse TTS (especially MAI).
+
+        We're speaking the command, not running it — the user wants the
+        gist. MAI rejects payloads with raw $, |, &, <, > as malformed,
+        and even when accepted those characters read aloud awkwardly.
+        Replace redirections / pipes with prose-friendly equivalents and
+        drop the rest.
+        """
+        cmd = cmd.strip()
+        # Replace common shell idioms with neutral phrasing.
+        cmd = re.sub(r"\s*2>&1\b", " with errors", cmd)
+        cmd = re.sub(r"\s*2?>\s*/dev/null\b", " quietly", cmd)
+        cmd = re.sub(r"\s*\|\s*", " piped to ", cmd)
+        # Drop characters that survive the regexes above. `$VAR` reads as
+        # "dollar var" by Azure / MAI which is rarely what the user wants;
+        # keep the bare name.
+        cmd = cmd.replace("$", "")
+        cmd = re.sub(r"[<>&;`]", " ", cmd)
+        cmd = " ".join(cmd.split())
+        if len(cmd) > 100:
+            cmd = cmd[:97] + "…"
+        return cmd
 
     @staticmethod
     def _friendly_path(p: str) -> str:

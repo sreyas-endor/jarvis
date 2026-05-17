@@ -65,6 +65,7 @@ from jarvis.sessions import (
     SessionRegistry,
     discover_sessions,
 )
+from jarvis.workers import WorkerManager
 
 # Bind 0.0.0.0 so the iPhone (over Tailscale or LAN) can reach us — Tailscale
 # will expose the port on the tailnet IP.
@@ -85,6 +86,17 @@ async def _run_pipeline_for_connection(connection: SmallWebRTCConnection) -> Non
         ),
     )
     task = build_pipeline_task(transport)
+
+    # The LLM service was just constructed inside build_pipeline_task and
+    # registered itself as the active instance. Wire the worker input
+    # sink so focused voice input routes to the WorkerManager.
+    active = ClaudeCodeLLMService.active_instance()
+    if active is not None:
+        active.set_worker_input_sink(_worker_sink)
+
+    # Reconcile worker registry on each call — picks up workers that
+    # survived a server restart.
+    await _worker_manager.reconcile()
 
     @transport.event_handler("on_client_connected")
     async def _on_connected(_transport, _client):
@@ -133,6 +145,12 @@ async def _narrate(event: NarrationEvent) -> None:
 
 
 _session_registry = SessionRegistry(on_event=_narrate)
+_worker_manager = WorkerManager()
+
+
+async def _worker_sink(name: str, text: str) -> bool:
+    """Called by the LLM service to deliver focused voice input to a worker."""
+    return await _worker_manager.send_input(name, text)
 
 
 @app.get("/health")
@@ -202,6 +220,91 @@ async def detach_session(body: dict) -> dict:
         return {"ok": False, "error": "missing session_id"}
     ok = await _session_registry.detach(session_id)
     return {"ok": ok}
+
+
+@app.post("/internal/worker/spawn")
+async def worker_spawn(body: dict) -> dict:
+    name = (body.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing name"}
+    try:
+        worker = await _worker_manager.spawn(
+            name=name,
+            cwd=body.get("cwd") or None,
+            initial_prompt=body.get("prompt") or None,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {
+        "ok": True,
+        "name": worker.name,
+        "tmux_session": worker.tmux_session,
+        "cwd": worker.cwd,
+        "session_id": worker.session_id,
+        "attach_cmd": f"tmux attach -t {worker.tmux_session}",
+    }
+
+
+@app.get("/internal/worker/list")
+async def worker_list() -> dict:
+    await _worker_manager.reconcile()
+    return {
+        "workers": [
+            {
+                "name": w.name,
+                "tmux_session": w.tmux_session,
+                "cwd": w.cwd,
+                "session_id": w.session_id,
+                "alive": w.is_alive(),
+                "attach_cmd": f"tmux attach -t {w.tmux_session}",
+            }
+            for w in _worker_manager.list()
+        ],
+        "focused": (
+            ClaudeCodeLLMService.active_instance().focused_worker
+            if ClaudeCodeLLMService.active_instance() is not None
+            else None
+        ),
+    }
+
+
+@app.post("/internal/worker/send")
+async def worker_send(body: dict) -> dict:
+    name = (body.get("name") or "").strip()
+    text = body.get("text") or ""
+    if not name or not text:
+        return {"ok": False, "error": "missing name or text"}
+    ok = await _worker_manager.send_input(name, text)
+    return {"ok": ok}
+
+
+@app.post("/internal/worker/kill")
+async def worker_kill(body: dict) -> dict:
+    name = (body.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "missing name"}
+    # If killing the focused worker, drop focus too — otherwise voice
+    # routes into a dead pane.
+    svc = ClaudeCodeLLMService.active_instance()
+    if svc is not None and svc.focused_worker == name:
+        svc.unfocus_worker()
+    ok = await _worker_manager.kill(name)
+    return {"ok": ok}
+
+
+@app.post("/internal/worker/focus")
+async def worker_focus(body: dict) -> dict:
+    name = (body.get("name") or "").strip()
+    svc = ClaudeCodeLLMService.active_instance()
+    if svc is None:
+        return {"ok": False, "error": "no active voice session"}
+    if not name:
+        svc.unfocus_worker()
+        return {"ok": True, "focused": None}
+    if _worker_manager.get(name) is None:
+        return {"ok": False, "error": f"worker {name!r} not found"}
+    svc.focus_worker(name)
+    return {"ok": True, "focused": name}
 
 
 @app.post("/internal/permission")
