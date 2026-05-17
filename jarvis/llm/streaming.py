@@ -35,22 +35,17 @@ class ClaudeStreamingProcess:
         workspace: Path,
         tools: list[str] | None = None,
         allowed_tools: list[str] | None = None,
-        permission_mode: str | None = None,
         append_system_prompt: str | None = None,
         add_dirs: list[Path] | None = None,
     ) -> None:
         self._model = model
         self._workspace = workspace
         self._tools = tools
-        # If None, every tool we expose is auto-permitted (back-compat).
-        # If supplied as a (possibly empty) list, only those tools auto-run;
-        # anything else in `tools` triggers a control_request that the
-        # ClaudeCodeLLMService voice-prompts the user about.
+        # If None, every tool in `tools` is auto-permitted. If supplied as
+        # a list, only those tools auto-run; anything else is effectively
+        # blocked because claude has no interactive prompt in stream-json
+        # mode.
         self._allowed_tools = allowed_tools
-        # "default" makes claude actually emit control_request for tools that
-        # aren't pre-allowed. Without it, claude either auto-runs or auto-denies
-        # depending on the runtime mode and our prompts never fire.
-        self._permission_mode = permission_mode
         self._append_system_prompt = append_system_prompt
         self._add_dirs = add_dirs or []
         self._session_id = str(uuid.uuid4())
@@ -71,6 +66,10 @@ class ClaudeStreamingProcess:
             "--include-partial-messages",
             "--model", self._model,
             "--session-id", self._session_id,
+            # Explicitly load the workspace-local settings (PreToolUse hook
+            # for the voice permission router). Stream-json mode doesn't
+            # always pick this up implicitly the way interactive mode does.
+            "--setting-sources", "project,local,user",
         ]
         if self._tools is not None:
             args += ["--tools", ",".join(self._tools)]
@@ -85,8 +84,6 @@ class ClaudeStreamingProcess:
             )
             if allowed:
                 args += ["--allowedTools", ",".join(allowed)]
-        if self._permission_mode:
-            args += ["--permission-mode", self._permission_mode]
         for d in self._add_dirs:
             args += ["--add-dir", str(d)]
         if self._append_system_prompt:
@@ -107,36 +104,6 @@ class ClaudeStreamingProcess:
             {"type": "user", "message": {"role": "user", "content": text}}
         )
         log.info("send_user: %r", text)
-        async with self._stdin_lock:
-            self._proc.stdin.write(payload.encode() + b"\n")
-            await asyncio.wait_for(self._proc.stdin.drain(), STDIN_FLUSH_TIMEOUT)
-
-    async def send_control_response(
-        self, request_id: str, allow: bool, message: str | None = None
-    ) -> None:
-        """Reply to a Claude Code permission control_request.
-
-        Wire format mirrors what Claude Code's interactive permission prompt
-        produces. `behavior` is "allow" or "deny"; deny may include a
-        free-form `message` claude surfaces in its next thought.
-        """
-        assert self._proc is not None and self._proc.stdin is not None
-        data: dict = {"behavior": "allow"} if allow else {"behavior": "deny"}
-        if not allow and message:
-            data["message"] = message
-        payload = json.dumps(
-            {
-                "type": "control_response",
-                "response": {
-                    "request_id": request_id,
-                    "subtype": "success",
-                    "data": data,
-                },
-            }
-        )
-        log.info(
-            "send_control_response: request_id=%s allow=%s", request_id, allow
-        )
         async with self._stdin_lock:
             self._proc.stdin.write(payload.encode() + b"\n")
             await asyncio.wait_for(self._proc.stdin.drain(), STDIN_FLUSH_TIMEOUT)

@@ -1,0 +1,16 @@
+{
+  "_comment": "Hook config consumed by Claude Code in stream-json mode. JARVIS_HOME is set by main.py before spawning claude so this path resolves regardless of where the repo lives. If you copy this template to another machine, make sure main.py is the parent process — JARVIS_HOME isn't set by anything else.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$JARVIS_HOME/.venv/bin/python $JARVIS_HOME/tools/voice_permission_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -17,6 +17,11 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# Hand the claude subprocess (and its PreToolUse voice-permission hook) a
+# stable handle to the repo root via env. settings.local.json references
+# $JARVIS_HOME for the hook command so the config travels across machines.
+os.environ["JARVIS_HOME"] = str(Path(__file__).parent.resolve())
+
 # Outbound IPv6 to api.cartesia.ai (CloudFront) silently times out on this
 # network — curl works because it does Happy Eyeballs, but the `websockets`
 # library picks the first getaddrinfo result and stalls 20s on the v6 socket.
@@ -53,6 +58,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
 )
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
+from jarvis.llm.service import ClaudeCodeLLMService
 from jarvis.pipeline import build_pipeline_task
 
 # Bind 0.0.0.0 so the iPhone (over Tailscale or LAN) can reach us — Tailscale
@@ -125,6 +131,27 @@ async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
 async def offer_patch(request: SmallWebRTCPatchRequest):
     await _request_handler.handle_patch_request(request)
     return {"status": "success"}
+
+
+@app.post("/internal/permission")
+async def internal_permission(body: dict) -> dict:
+    """PreToolUse hook entrypoint. Called by tools/voice_permission_hook.py.
+
+    Forwards the tool name/args to whichever ClaudeCodeLLMService is
+    currently driving the active voice call; that service speaks the
+    prompt, waits for a yes/no in the next transcription, and returns
+    the verdict.
+
+    Fails closed if no call is in progress — better than auto-allowing
+    a destructive tool when no human is on the line to object.
+    """
+    svc = ClaudeCodeLLMService.active_instance()
+    if svc is None:
+        return {"allow": False, "reason": "no active voice session"}
+    return await svc.request_permission_voice(
+        tool=body.get("tool", "") or "",
+        args=body.get("args") or {},
+    )
 
 
 # Browser test page for smoke-testing the WebRTC plumbing without Xcode.
