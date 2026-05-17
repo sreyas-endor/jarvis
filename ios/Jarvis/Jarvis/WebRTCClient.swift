@@ -9,8 +9,15 @@ import WebRTC
 ///      track, generates an SDP offer, waits for ICE gathering to complete,
 ///      POSTs the offer to /api/offer on the Mac, applies the answer.
 ///   2. WebRTC handles audio in/out from then on. Remote audio plays through
-///      RTCAudioSession (which CallKit has already configured to .voiceChat).
+///      RTCAudioSession (which CallKit configures to .voiceChat).
 ///   3. close() tears down the peer connection.
+///
+/// We let WebRTC manage the audio session itself (useManualAudio = false,
+/// the default). CallKit already swings AVAudioSession into .voiceChat
+/// mode in provider(_:didActivate:); WebRTC sees that and starts capture.
+/// Manual-audio mode is the more "correct" CallKit integration but ships
+/// with subtle timing bugs around isAudioEnabled vs. the audio unit start;
+/// the auto path is more forgiving and works fine for a personal app.
 final class WebRTCClient: NSObject {
     static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
@@ -24,25 +31,21 @@ final class WebRTCClient: NSObject {
 
     var onConnectionStateChange: ((String) -> Void)?
 
-    static func activateAudioSession() {
+    /// CallKit gives us a configured AVAudioSession. Tell RTCAudioSession the
+    /// system session is now active so it routes capture/playback through it.
+    static func activateAudioSession(_ audioSession: AVAudioSession) {
         let rtcSession = RTCAudioSession.sharedInstance()
         rtcSession.lockForConfiguration()
-        do {
-            // CallKit already set category/mode on the underlying AVAudioSession;
-            // we just need RTCAudioSession to acknowledge the system audio
-            // session is "active" so it routes capture/playback through it.
-            try rtcSession.setCategory(AVAudioSession.Category.playAndRecord, mode: AVAudioSession.Mode.voiceChat, options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker])
-            try rtcSession.setActive(true)
-        } catch {
-            print("RTCAudioSession activate failed: \(error)")
-        }
+        rtcSession.audioSessionDidActivate(audioSession)
+        rtcSession.isAudioEnabled = true
         rtcSession.unlockForConfiguration()
     }
 
-    static func deactivateAudioSession() {
+    static func deactivateAudioSession(_ audioSession: AVAudioSession) {
         let rtcSession = RTCAudioSession.sharedInstance()
         rtcSession.lockForConfiguration()
-        try? rtcSession.setActive(false)
+        rtcSession.isAudioEnabled = false
+        rtcSession.audioSessionDidDeactivate(audioSession)
         rtcSession.unlockForConfiguration()
     }
 
@@ -57,19 +60,15 @@ final class WebRTCClient: NSObject {
         }
         self.peerConnection = pc
 
-        // Local mic
+        // Local mic. pc.add() in unified-plan creates a sendRecv transceiver
+        // for the track automatically.
         let audioConstraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
         let audioSource = WebRTCClient.factory.audioSource(with: audioConstraints)
         let audioTrack = WebRTCClient.factory.audioTrack(with: audioSource, trackId: "audio0")
         self.localAudioTrack = audioTrack
+        audioTrack.isEnabled = true
         pc.add(audioTrack, streamIds: ["stream0"])
 
-        // Make sure we negotiate to *receive* audio from the bot too.
-        let transceiverInit = RTCRtpTransceiverInit()
-        transceiverInit.direction = .sendRecv
-        _ = pc.addTransceiver(of: .audio, init: transceiverInit)
-
-        // Offer
         let offerConstraints = RTCMediaConstraints(
             mandatoryConstraints: [
                 "OfferToReceiveAudio": "true",
@@ -92,9 +91,6 @@ final class WebRTCClient: NSObject {
         // Wait for ICE gathering to finish (non-trickle: simplest signaling).
         try await waitForICEGatheringComplete()
 
-        // POST to Mac. Use pc.localDescription (which now has the final SDP
-        // with all gathered candidates baked in) rather than the offer we
-        // generated before gathering.
         guard let url = URL(string: serverURL.trimmingCharacters(in: .whitespaces) + "/api/offer") else {
             throw NSError(domain: "Jarvis", code: -3, userInfo: [NSLocalizedDescriptionKey: "Bad server URL"])
         }

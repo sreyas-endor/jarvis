@@ -122,10 +122,10 @@ extension CallManager: CXProviderDelegate {
     /// shares the underlying AVAudioSession. Mode = .voiceChat is what triggers
     /// system audio ducking (Apple Music, podcasts, etc.).
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-        WebRTCClient.activateAudioSession()
+        WebRTCClient.activateAudioSession(audioSession)
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-        WebRTCClient.deactivateAudioSession()
+        WebRTCClient.deactivateAudioSession(audioSession)
     }
 }

@@ -75,6 +75,13 @@ async def _run_pipeline_for_connection(connection: SmallWebRTCConnection) -> Non
     )
     task = build_pipeline_task(transport)
 
+    @transport.event_handler("on_client_connected")
+    async def _on_connected(_transport, _client):
+        log.info(
+            "client connected; audio_input_track=%s",
+            _client.audio_input_track() is not None,
+        )
+
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnected(_transport, _client):
         log.info("client disconnected; cancelling pipeline")
