@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "Voice-controlled laptop assistant using Pipecat + Claude Code"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "pipecat-ai[cartesia,silero,local,mlx-whisper,azure]>=0.0.70",
+    "pipecat-ai[cartesia,silero,local,mlx-whisper,azure,webrtc]>=0.0.70",
     "python-dotenv>=1.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [build-system]

@@ -33,3 +33,9 @@ dist/
 .cache/
 .huggingface/
 .mlx-cache/
+
+# Xcode
+**/xcuserdata/
+**/*.xcuserstate
+**/DerivedData/
+**/Package.resolved

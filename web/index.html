@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Jarvis test client</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 540px; margin: 40px auto; padding: 0 16px; }
+  button { font-size: 18px; padding: 12px 20px; border-radius: 10px; border: 1px solid #888; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #status { margin-top: 16px; padding: 12px; background: #f4f4f4; border-radius: 8px; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .row { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
+  input { padding: 8px; font-size: 14px; flex: 1; border-radius: 6px; border: 1px solid #bbb; font-family: ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<h1>Jarvis test client</h1>
+<p>Smoke test for the Mac WebRTC server. Browser captures your mic, posts an SDP offer, plays Jarvis's audio back.</p>
+<div class="row">
+  <label>Server:</label>
+  <input id="server" value="http://localhost:7860" />
+</div>
+<div class="row">
+  <button id="callBtn">Call Jarvis</button>
+  <button id="hangBtn" disabled>Hang up</button>
+</div>
+<audio id="remoteAudio" autoplay playsinline></audio>
+<div id="status">idle</div>
+
+<script>
+const log = (m) => {
+  const el = document.getElementById('status');
+  el.textContent = (new Date().toISOString().slice(11,19)) + '  ' + m + '\n' + el.textContent;
+};
+
+let pc = null;
+let localStream = null;
+
+document.getElementById('callBtn').onclick = async () => {
+  try {
+    const server = document.getElementById('server').value.replace(/\/$/, '');
+    document.getElementById('callBtn').disabled = true;
+
+    log('requesting mic…');
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    });
+
+    pc.ontrack = (ev) => {
+      log('remote track: ' + ev.track.kind);
+      document.getElementById('remoteAudio').srcObject = ev.streams[0];
+    };
+    pc.oniceconnectionstatechange = () => log('ICE: ' + pc.iceConnectionState);
+    pc.onconnectionstatechange = () => log('PC:  ' + pc.connectionState);
+
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
+    }
+    // Need to receive audio back from Jarvis even though we're not sending video.
+    pc.addTransceiver('audio', { direction: 'sendrecv' });
+
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
+    await pc.setLocalDescription(offer);
+
+    // Wait for ICE gathering to complete so we can ship a fully-baked SDP
+    // without the trickle-ICE PATCH dance. Simpler for the first test.
+    await new Promise((resolve) => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      const check = () => {
+        if (pc.iceGatheringState === 'complete') {
+          pc.removeEventListener('icegatheringstatechange', check);
+          resolve();
+        }
+      };
+      pc.addEventListener('icegatheringstatechange', check);
+    });
+
+    log('posting offer → ' + server + '/api/offer');
+    const resp = await fetch(server + '/api/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sdp: pc.localDescription.sdp,
+        type: pc.localDescription.type,
+      }),
+    });
+    if (!resp.ok) {
+      throw new Error('server ' + resp.status + ': ' + (await resp.text()));
+    }
+    const answer = await resp.json();
+    log('got answer pc_id=' + answer.pc_id);
+    await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
+    document.getElementById('hangBtn').disabled = false;
+  } catch (e) {
+    log('error: ' + e.message);
+    document.getElementById('callBtn').disabled = false;
+  }
+};
+
+document.getElementById('hangBtn').onclick = () => {
+  if (pc) { pc.close(); pc = null; }
+  if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+  document.getElementById('remoteAudio').srcObject = null;
+  document.getElementById('callBtn').disabled = false;
+  document.getElementById('hangBtn').disabled = true;
+  log('hung up');
+};
+</script>
+</body>
+</html>

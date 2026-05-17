@@ -1,10 +1,12 @@
-"""Jarvis voice agent — mic in, Claude Code as brain, voice out.
+"""Jarvis voice agent — WebRTC server. iPhone client connects, Mac runs pipeline.
 
-Pipeline: LocalAudioTransport → VAD → STT → ClaudeCodeLLMService → TTS →
-EventLogger → LocalAudioTransport. STT and TTS providers are swappable
-via STT_PROVIDER and TTS_PROVIDER env vars; see README for the matrix.
+Pipeline per call: SmallWebRTCTransport.input → VAD → STT → ClaudeCodeLLMService →
+TTS → EventLogger → SmallWebRTCTransport.output. STT and TTS providers selected
+via STT_PROVIDER and TTS_PROVIDER env vars; see README.
 
-Run with AirPods or wired headphones to avoid the laptop-speaker echo loop.
+Mac stays running headless (lid closed, on AC). iOS app POSTs SDP offer to
+/api/offer; we spin up a fresh pipeline bound to that connection, tear down
+when the client disconnects.
 """
 
 from __future__ import annotations
@@ -33,11 +35,14 @@ def _ipv4_only_getaddrinfo(*args, **kwargs):
 
 _socket.getaddrinfo = _ipv4_only_getaddrinfo
 
-# Load .env (e.g. CARTESIA_API_KEY) before pipecat services try to read env.
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
+import uvicorn
+from fastapi import BackgroundTasks, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
@@ -59,49 +64,26 @@ from pipecat.services.azure.tts import AzureTTSService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.whisper.stt import MLXModel, WhisperMLXSTTSettings
 from pipecat.transcriptions.language import Language
-from pipecat.transports.local.audio import (
-    LocalAudioTransport,
-    LocalAudioTransportParams,
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.request_handler import (
+    SmallWebRTCPatchRequest,
+    SmallWebRTCRequest,
+    SmallWebRTCRequestHandler,
 )
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from jarvis.azure_openai_tts_service import AzureOpenAITTSService
 from jarvis.azure_phraselist_stt_service import AzurePhraseListSTTService
 from jarvis.claude_code_llm_service import ClaudeCodeLLMService
 from jarvis.whisper_jargon_stt_service import WhisperJargonSTTService
 
-# Cartesia "Skylar - Friendly Guide" voice (resolved from
-# https://api.cartesia.ai/voices on 2026-05-14).
 SKYLAR_VOICE_ID = "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
-# Azure Speech default voice — multilingual neural voices are noticeably more
-# natural than the older Aria/Jenny/Sara line. Ava is widely regarded as
-# Azure's most natural conversational female.
 AZURE_DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
-# Tuned to approximate Cartesia Skylar's character: warm/approachable
-# customer-care female. We push style intensity but keep pitch at default —
-# Ava's natural range is already on the higher side; lifting it reads
-# squeaky.
-#   style="friendly"      — warmer than "chat" (casual) or "customerservice" (polished)
-#   style_degree=1.5      — push expressivity without cartoonish-ness (1.0=neutral, 2.0=max)
-#   pitch=None            — no prosody pitch shift; override via AZURE_SPEECH_PITCH if needed
 AZURE_DEFAULT_STYLE = "friendly"
 AZURE_DEFAULT_STYLE_DEGREE = "1.5"
 AZURE_DEFAULT_PITCH: str | None = None
 
-# OpenAI TTS (via Azure AI Foundry) defaults — targeting Cartesia Skylar's
-# warm conversational character. gpt-4o-mini-tts is the only OpenAI TTS
-# model that supports the `instructions` field; tts-hd and tts ignore it
-# but still use the voice setting.
-#   fable — explicitly described as "warm, storytelling"; closest literal
-#           match to Skylar's character in the OpenAI voice set
-#   instructions — community findings (community.openai.com forums) say the
-#                  model handles ONE concrete persona much better than a
-#                  stack of adjectives. Short single-persona prompts beat
-#                  long descriptive ones. Edit in-place to tune delivery;
-#                  not overridable via env (intentional — keep the prompt
-#                  in code where it's reviewable alongside voice selection).
-#   N.B. There's a known regression in the current model alias — pinning
-#   the Foundry deployment to model version 2025-03-20 restores stronger
-#   instruction-following and naturalness.
 OPENAI_DEFAULT_DEPLOYMENT = "gpt-4o-mini-tts"
 OPENAI_DEFAULT_API_VERSION = "2024-10-01-preview"
 OPENAI_DEFAULT_VOICE = "fable"
@@ -111,28 +93,8 @@ OPENAI_DEFAULT_INSTRUCTIONS = (
     "Natural conversational pace, genuine smile in your voice."
 )
 
-# Microsoft MAI-Voice-1 — Microsoft's flagship expressive TTS, Aug 2025.
-# Uses the standard Azure Speech SDK/REST API (same key + region as
-# AZURE_SPEECH_KEY / AZURE_SPEECH_REGION). Voice name format is
-# "{base-voice}:MAI-Voice-1". Roster:
-#   en-US-Jasper:MAI-Voice-1   (male, expressive)
-#   en-US-June:MAI-Voice-1     (female, warm-conversational) ← default
-#   en-US-Grant:MAI-Voice-1    (male)
-#   en-US-Iris:MAI-Voice-1     (female)
-#   en-US-Reed:MAI-Voice-1     (male)
-#   en-US-Joy:MAI-Voice-1      (female, upbeat)
-# Override via MAI_VOICE env var.
-#
-# Caveats:
-#   - Public preview; only available in select Azure regions
-#   - $22/1M chars (~50x standard Azure Speech, but cheap for personal use)
-#   - No SSML style override here — MAI voices are natively expressive
 MAI_DEFAULT_VOICE = "en-US-June:MAI-Voice-1"
 
-# Single source of truth for jargon biasing — used by both the Azure
-# phrase-list STT (acoustic-model biasing) and the Whisper fallback
-# (LM-prompt biasing). Put highest-value terms early; Whisper truncates
-# past ~224 tokens, Azure phrase lists have no equivalent cap.
 JARGON_PHRASES = [
     "Claude", "Claude Code", "Anthropic", "Pipecat", "Cartesia",
     "Whisper", "MLX", "ElevenLabs", "OpenAI", "Cursor",
@@ -152,6 +114,13 @@ WHISPER_INITIAL_PROMPT = (
     + ", ".join(JARGON_PHRASES) + "."
 )
 
+WORKSPACE = Path(__file__).parent / "workspace"
+
+# WebRTC server defaults. Bind 0.0.0.0 so the iPhone (over Tailscale or LAN)
+# can reach us — Tailscale will expose the port on the tailnet IP.
+JARVIS_HOST = os.environ.get("JARVIS_HOST", "0.0.0.0")
+JARVIS_PORT = int(os.environ.get("JARVIS_PORT", "7860"))
+
 
 def _require_env(name: str) -> str:
     val = os.environ.get(name)
@@ -161,14 +130,6 @@ def _require_env(name: str) -> str:
 
 
 def _build_stt():
-    """Pick an STT service based on STT_PROVIDER env var (default: azure).
-
-    azure   — Azure Speech with PhraseListGrammar attached. Acoustic-layer
-              biasing toward JARGON_PHRASES; strictly stronger than Whisper's
-              LM-prompt biasing for known-vocabulary cases. Cloud.
-    whisper — Local Whisper Large V3 Turbo Q4 with initial_prompt biasing
-              (WhisperJargonSTTService). No network needed.
-    """
     provider = os.environ.get("STT_PROVIDER", "azure").lower()
     if provider == "azure":
         return AzurePhraseListSTTService(
@@ -187,7 +148,6 @@ def _build_stt():
 
 
 def _build_tts():
-    """Pick a TTS service based on TTS_PROVIDER env var (default: cartesia)."""
     provider = os.environ.get("TTS_PROVIDER", "cartesia").lower()
     if provider == "cartesia":
         return CartesiaTTSService(
@@ -214,9 +174,6 @@ def _build_tts():
             ),
         )
     if provider == "mai":
-        # MAI-Voice-1 runs on the same Azure Speech service — same key/region,
-        # different voice name. No SSML style overrides; the model is natively
-        # expressive.
         return AzureTTSService(
             api_key=_require_env("AZURE_SPEECH_KEY"),
             region=_require_env("AZURE_SPEECH_REGION"),
@@ -270,21 +227,9 @@ class EventLogger(FrameProcessor):
             self._tts_audio_bytes += len(frame.audio)
         await self.push_frame(frame, direction)
 
-WORKSPACE = Path(__file__).parent / "workspace"
 
-
-async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
-
-    # VAD must be wired as a pipeline processor in Pipecat 1.1.0.
-    # vad_analyzer is not a valid TransportParams field — Pydantic silently
-    # drops the kwarg, so attaching it to LocalAudioTransportParams is a no-op.
-    # Volume gate disabled because the MacBook internal mic peaks around
-    # 0.1-0.15 of full scale; Silero's model handles speech detection on its own.
-    vad = SileroVADAnalyzer(
+def _build_vad() -> SileroVADAnalyzer:
+    return SileroVADAnalyzer(
         params=VADParams(
             confidence=0.8,
             start_secs=0.35,
@@ -292,23 +237,33 @@ async def main() -> None:
             min_volume=0.0,
         )
     )
-    transport = LocalAudioTransport(
-        LocalAudioTransportParams(
+
+
+async def _run_pipeline_for_connection(connection: SmallWebRTCConnection) -> None:
+    """One pipeline per call. Tears down when the client disconnects."""
+    log = logging.getLogger("jarvis.pipeline")
+    log.info("connection accepted pc_id=%s", connection.pc_id)
+
+    transport = SmallWebRTCTransport(
+        webrtc_connection=connection,
+        params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-        )
+            # iOS WebRTC negotiates Opus at 48k. Let Pipecat pick sample rates.
+        ),
     )
-
     stt = _build_stt()
-    logging.info("STT provider: %s", type(stt).__name__)
     llm = ClaudeCodeLLMService(workspace=WORKSPACE)
     tts = _build_tts()
-    logging.info("TTS provider: %s", type(tts).__name__)
+
+    log.info(
+        "providers: stt=%s tts=%s", type(stt).__name__, type(tts).__name__
+    )
 
     pipeline = Pipeline(
         [
             transport.input(),
-            VADProcessor(vad_analyzer=vad),
+            VADProcessor(vad_analyzer=_build_vad()),
             stt,
             llm,
             tts,
@@ -316,14 +271,70 @@ async def main() -> None:
             transport.output(),
         ]
     )
-
     task = PipelineTask(
         pipeline,
         params=PipelineParams(allow_interruptions=True),
     )
 
-    await PipelineRunner().run(task)
+    @transport.event_handler("on_client_disconnected")
+    async def _on_disconnected(_transport, _client):
+        log.info("client disconnected; cancelling pipeline")
+        await task.cancel()
+
+    try:
+        await PipelineRunner(handle_sigint=False).run(task)
+    finally:
+        log.info("pipeline finished pc_id=%s", connection.pc_id)
+
+
+app = FastAPI(title="Jarvis voice agent")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# SINGLE mode = one call at a time. This is a personal voice assistant; if a
+# second client connects while a session is active the handler rejects it.
+_request_handler = SmallWebRTCRequestHandler()
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True}
+
+
+@app.post("/api/offer")
+async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
+    async def _on_new_connection(connection: SmallWebRTCConnection) -> None:
+        background_tasks.add_task(_run_pipeline_for_connection, connection)
+
+    return await _request_handler.handle_web_request(
+        request=request,
+        webrtc_connection_callback=_on_new_connection,
+    )
+
+
+@app.patch("/api/offer")
+async def offer_patch(request: SmallWebRTCPatchRequest):
+    await _request_handler.handle_patch_request(request)
+    return {"status": "success"}
+
+
+# Browser test page for smoke-testing the WebRTC plumbing without Xcode.
+# Mounted last so /api/* routes win when there's a name collision.
+_web_dir = Path(__file__).parent / "web"
+if _web_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(_web_dir), html=True), name="web")
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    uvicorn.run(app, host=JARVIS_HOST, port=JARVIS_PORT, log_level="info")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
