@@ -279,6 +279,10 @@ class ClaudeCodeLLMService(LLMService):
         # the WorkerManager singleton, which lives in the FastAPI process).
         self._focused_worker: str | None = None
         self._worker_input_sink: "Callable[[str, str], Awaitable[bool]] | None" = None
+        # Fires when focus is dropped (voice phrase OR explicit unfocus
+        # call) so main.py can detach the verbose narration tailer for
+        # the previously focused worker.
+        self._on_unfocus: "Callable[[str], Awaitable[None]] | None" = None
 
         type(self)._current_instance = self
 
@@ -324,7 +328,7 @@ class ClaudeCodeLLMService(LLMService):
                 lower = text.lower()
                 if any(re.match(p, lower) for p in _UNFOCUS_PHRASES):
                     name = self._focused_worker
-                    self._focused_worker = None
+                    self.unfocus_worker()
                     self._suppress_text_until_next_send = False
                     await self.push_frame(
                         TTSSpeakFrame(
@@ -343,7 +347,7 @@ class ClaudeCodeLLMService(LLMService):
                         TTSSpeakFrame(text="sent", append_to_context=False)
                     )
                 else:
-                    self._focused_worker = None
+                    self.unfocus_worker()
                     await self.push_frame(
                         TTSSpeakFrame(
                             text="that worker isn't responding. back to me.",
@@ -484,11 +488,25 @@ class ClaudeCodeLLMService(LLMService):
         """
         self._worker_input_sink = sink
 
+    def set_on_unfocus(
+        self, callback: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """Called with the previously-focused worker name when focus drops.
+
+        Lets main.py detach the verbose narration tailer so it stops
+        speaking the worker's text over the master after the user leaves.
+        """
+        self._on_unfocus = callback
+
     def focus_worker(self, name: str) -> None:
         self._focused_worker = name
 
     def unfocus_worker(self) -> None:
+        prior = self._focused_worker
         self._focused_worker = None
+        if prior is not None and self._on_unfocus is not None:
+            # Fire and forget; caller doesn't care about completion.
+            asyncio.create_task(self._on_unfocus(prior))
 
     @property
     def focused_worker(self) -> str | None:

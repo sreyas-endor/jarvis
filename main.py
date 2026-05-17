@@ -93,6 +93,7 @@ async def _run_pipeline_for_connection(connection: SmallWebRTCConnection) -> Non
     active = ClaudeCodeLLMService.active_instance()
     if active is not None:
         active.set_worker_input_sink(_worker_sink)
+        active.set_on_unfocus(_on_unfocus)
 
     # Reconcile worker registry on each call — picks up workers that
     # survived a server restart.
@@ -138,8 +139,17 @@ async def _narrate(event: NarrationEvent) -> None:
     svc = ClaudeCodeLLMService.active_instance()
     if svc is None:
         return
-    # Use the session id's leading 4 hex chars so we have *some* handle to
-    # disambiguate in voice without reading out a full UUID.
+    # If the event's session belongs to a focused worker, speak the
+    # worker's text "raw" — the user is talking to that worker and
+    # wants its full response, no "session abcd:" prefix.
+    focused = svc.focused_worker
+    if focused is not None:
+        worker = _worker_manager.get(focused)
+        if worker is not None and worker.session_id == event.session_id:
+            await svc.speak_narration(event.summary)
+            return
+    # Otherwise this is a background read-only attach — prefix with a
+    # short id so the user knows which session we're narrating.
     label = event.session_id[:4]
     await svc.speak_narration(f"session {label}: {event.summary}")
 
@@ -151,6 +161,13 @@ _worker_manager = WorkerManager()
 async def _worker_sink(name: str, text: str) -> bool:
     """Called by the LLM service to deliver focused voice input to a worker."""
     return await _worker_manager.send_input(name, text)
+
+
+async def _on_unfocus(name: str) -> None:
+    """Detach the verbose narration tailer when focus is dropped."""
+    worker = _worker_manager.get(name)
+    if worker is not None and worker.session_id:
+        await _session_registry.detach(worker.session_id)
 
 
 @app.get("/health")
@@ -298,12 +315,31 @@ async def worker_focus(body: dict) -> dict:
     svc = ClaudeCodeLLMService.active_instance()
     if svc is None:
         return {"ok": False, "error": "no active voice session"}
+    # Unfocus path: drop focus + detach the verbose narration tailer so
+    # the worker doesn't keep speaking over the master after the user
+    # leaves.
     if not name:
+        prior = svc.focused_worker
         svc.unfocus_worker()
+        if prior is not None:
+            prior_worker = _worker_manager.get(prior)
+            if prior_worker is not None and prior_worker.session_id:
+                await _session_registry.detach(prior_worker.session_id)
         return {"ok": True, "focused": None}
-    if _worker_manager.get(name) is None:
+
+    worker = _worker_manager.get(name)
+    if worker is None:
         return {"ok": False, "error": f"worker {name!r} not found"}
+    # If switching from one focused worker to another, detach the
+    # previous one's verbose tailer first.
+    prior = svc.focused_worker
+    if prior and prior != name:
+        prior_worker = _worker_manager.get(prior)
+        if prior_worker is not None and prior_worker.session_id:
+            await _session_registry.detach(prior_worker.session_id)
     svc.focus_worker(name)
+    if worker.session_id:
+        await _session_registry.attach(worker.session_id, verbose=True)
     return {"ok": True, "focused": name}
 
 

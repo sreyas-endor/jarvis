@@ -185,12 +185,17 @@ def find_session(session_id: str) -> SessionInfo | None:
 # Narration filtering ---------------------------------------------------------
 
 
-def _summarize_event(session_id: str, ev: dict) -> NarrationEvent | None:
+def _summarize_event(
+    session_id: str, ev: dict, *, verbose: bool = False
+) -> NarrationEvent | None:
     """Pick out the user-interesting events from raw JSONL.
 
-    Skips streaming text deltas, parent-uuid chatter, queue operations,
-    and anything we don't have a short phrasing for. The voice user
-    wants headlines, not a transcript.
+    Default (verbose=False): tool calls + truncated assistant final text.
+    Headlines only — the user wants to know what's happening at a glance.
+
+    verbose=True: full assistant text content is emitted. Used when the
+    user is "focused" on this session — they want to hear it talk back,
+    not get a summary.
     """
     ev_type = ev.get("type")
 
@@ -226,8 +231,9 @@ def _summarize_event(session_id: str, ev: dict) -> NarrationEvent | None:
                     kind="tool_use",
                     summary=_phrase_tool_use(tool, inp),
                 )
-        # Otherwise, surface assistant text only if it looks like a turn
-        # completion (final answer) — skip if claude is mid-tool-result.
+        # Otherwise, surface assistant text. In verbose mode we read the
+        # full content; in headline mode we truncate to keep the voice
+        # channel skim-friendly.
         text_parts = [
             block.get("text", "")
             for block in content
@@ -238,7 +244,7 @@ def _summarize_event(session_id: str, ev: dict) -> NarrationEvent | None:
             return NarrationEvent(
                 session_id=session_id,
                 kind="assistant_text",
-                summary=_truncate(text, 120),
+                summary=text if verbose else _truncate(text, 120),
             )
         return None
 
@@ -282,15 +288,24 @@ class SessionTailer:
 
     Starts at end-of-file (we don't replay history). Polls for size
     changes; reads new lines; runs each through ``_summarize_event``.
+
+    ``verbose`` controls how chatty the tailer is: False (default) emits
+    truncated headlines and throttles, suitable for background "what's
+    happening over there" narration; True emits full assistant text and
+    skips throttling so the user can hear the worker talk back when
+    they've focused on it.
     """
 
     def __init__(
         self,
         session: SessionInfo,
         on_event: Callable[[NarrationEvent], Awaitable[None]],
+        *,
+        verbose: bool = False,
     ) -> None:
         self._session = session
         self._on_event = on_event
+        self._verbose = verbose
         self._task: asyncio.Task | None = None
         self._last_emit = 0.0
 
@@ -336,7 +351,9 @@ class SessionTailer:
                     ev = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                summary = _summarize_event(self._session.session_id, ev)
+                summary = _summarize_event(
+                    self._session.session_id, ev, verbose=self._verbose
+                )
                 if summary is not None:
                     pending.append(summary)
         except asyncio.CancelledError:
@@ -350,12 +367,25 @@ class SessionTailer:
                 pass
 
     async def _maybe_emit(self, pending: list[NarrationEvent]) -> None:
-        """Throttle: emit at most one event per NARRATION_MIN_GAP_SECONDS.
+        """Emit pending narration events.
 
-        When multiple events accumulate inside one gap window we keep the
-        *last* one (most recent state) and drop the rest. Headline beats
-        a stale running commentary.
+        Headline mode (verbose=False): throttle to one event per
+        ``NARRATION_MIN_GAP_SECONDS`` and keep only the latest. The user
+        gets a skim, not a transcript.
+
+        Verbose mode: deliver every event in order. The user has
+        focused on this worker and wants to hear it talk.
         """
+        if self._verbose:
+            for ev in pending:
+                try:
+                    await self._on_event(ev)
+                except Exception:
+                    log.exception("narration callback raised")
+            pending.clear()
+            self._last_emit = time.monotonic()
+            return
+
         now = time.monotonic()
         if now - self._last_emit < NARRATION_MIN_GAP_SECONDS:
             # Hold for next tick. Trim list to bounded size so a stuck
@@ -386,16 +416,22 @@ class SessionRegistry:
     def attached_ids(self) -> list[str]:
         return list(self._tailers.keys())
 
-    async def attach(self, session_id: str) -> SessionInfo | None:
+    async def attach(
+        self, session_id: str, *, verbose: bool = False
+    ) -> SessionInfo | None:
         async with self._lock:
-            if session_id in self._tailers:
-                # Already attached. Return its info so callers can confirm.
-                info = find_session(session_id)
-                return info
+            existing = self._tailers.get(session_id)
+            if existing is not None:
+                # Already attached. If the requested verbosity differs,
+                # swap the tailer so focus-then-attach upgrades cleanly.
+                if existing._verbose == verbose:
+                    return find_session(session_id)
+                await existing.stop()
+                self._tailers.pop(session_id, None)
             info = find_session(session_id)
             if info is None:
                 return None
-            tailer = SessionTailer(info, self._on_event)
+            tailer = SessionTailer(info, self._on_event, verbose=verbose)
             tailer.start()
             self._tailers[session_id] = tailer
             return info

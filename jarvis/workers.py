@@ -23,6 +23,7 @@ to submit, which keeps escaping simple.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -182,19 +183,39 @@ class WorkerManager:
 
             # Detached tmux: -d. New session: new-session. Working dir:
             # -c. Command: pass the full claude invocation.
-            # Force emacs editor mode for the worker — the user's vim
-            # mode in ~/.claude/settings.json puts the TUI in modal
-            # editing, which makes programmatic input via tmux unreliable
-            # (Escape sequences race the next keystroke). Emacs mode
-            # gives us a flat input where pasted text + Enter submits
-            # the way you'd expect.
+            # Worker settings, passed inline so they work regardless of
+            # the worker's cwd:
+            #   - editorMode=emacs: flat input, no vim modal weirdness
+            #     when we paste programmatically via tmux.
+            #   - PreToolUse hook: reuse the master's voice permission
+            #     flow so the worker's risky tool calls (Edit/Write/Bash)
+            #     ask the user over the same call instead of waiting on
+            #     a TUI prompt no one sees.
+            jarvis_home = os.environ.get("JARVIS_HOME", "")
+            hook_cmd = (
+                f"{jarvis_home}/.venv/bin/python "
+                f"{jarvis_home}/tools/voice_permission_hook.py"
+            )
+            worker_settings = {
+                "editorMode": "emacs",
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+                            "hooks": [
+                                {"type": "command", "command": hook_cmd}
+                            ],
+                        }
+                    ]
+                },
+            }
             cmd = [
                 "tmux", "new-session", "-d",
                 "-s", tmux_session,
                 "-c", resolved_cwd,
                 "claude",
                 "--session-id", session_id,
-                "--settings", '{"editorMode":"emacs"}',
+                "--settings", json.dumps(worker_settings),
                 # No --print: we want the interactive UI so the user
                 # can attach via tmux attach.
             ]
