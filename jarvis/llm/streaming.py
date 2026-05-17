@@ -35,11 +35,13 @@ class ClaudeStreamingProcess:
         workspace: Path,
         tools: list[str] | None = None,
         append_system_prompt: str | None = None,
+        add_dirs: list[Path] | None = None,
     ) -> None:
         self._model = model
         self._workspace = workspace
         self._tools = tools
         self._append_system_prompt = append_system_prompt
+        self._add_dirs = add_dirs or []
         self._session_id = str(uuid.uuid4())
         self._proc: asyncio.subprocess.Process | None = None
         self._stdin_lock = asyncio.Lock()
@@ -66,6 +68,8 @@ class ClaudeStreamingProcess:
             # what's available; --allowedTools is what runs without asking.
             if self._tools:
                 args += ["--allowedTools", ",".join(self._tools)]
+        for d in self._add_dirs:
+            args += ["--add-dir", str(d)]
         if self._append_system_prompt:
             args += ["--append-system-prompt", self._append_system_prompt]
         log.info("spawn long-running claude: %s", " ".join(args))
