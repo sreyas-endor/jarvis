@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.jarvis</string>
+
+    <!-- Run the server. caffeinate -i wraps the python process so macOS won't
+         throttle it via App Nap when the lid is closed. Without caffeinate
+         the Pipecat event loop slows to a crawl after a few minutes of
+         lid-closed idle. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>/Users/REPLACE_ME/.local/bin/uv</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>/Users/REPLACE_ME/projects/jarvis</string>
+        <string>python</string>
+        <string>main.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/REPLACE_ME/projects/jarvis</string>
+
+    <!-- Boot on login and resurrect on crash. KeepAlive=true blindly
+         restarts; if the server is failing fast in a loop look at the log
+         file rather than ignoring this. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle restarts so a crash loop doesn't burn CPU. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/jarvis.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/jarvis.err.log</string>
+
+    <!-- Aqua = the GUI login session. Required so the agent has access to
+         the user's keychain and audio devices. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- Don't let macOS demote the process under memory pressure. The
+         claude subprocess can briefly spike past 1GB during long turns. -->
+    <key>LowPriorityIO</key>
+    <false/>
+</dict>
+</plist>

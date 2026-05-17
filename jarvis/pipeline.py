@@ -87,14 +87,19 @@ class EventLogger(FrameProcessor):
 def _build_vad() -> SileroVADAnalyzer:
     # VAD must be wired as a pipeline processor in Pipecat 1.1.0 — the
     # vad_analyzer kwarg on transport params is silently dropped by Pydantic.
-    # Volume gate disabled (min_volume=0) because the MacBook internal mic
-    # peaks ~0.1-0.15 of full scale; Silero handles speech detection on its
-    # own.
+    # Volume gate disabled (min_volume=0) because mic levels vary widely
+    # across input devices (AirPods over WebRTC, MacBook internal mic);
+    # Silero handles speech detection on its own.
+    #
+    # stop_secs=0.4 is the latency-sensitive knob: shorter endpoint wait =
+    # snappier turns but a higher chance of cutting off speech mid-pause.
+    # 0.4s is the sweet spot we've found for conversational pace; 0.7s
+    # (the default) feels noticeably laggy on a real call.
     return SileroVADAnalyzer(
         params=VADParams(
             confidence=0.8,
-            start_secs=0.35,
-            stop_secs=0.7,
+            start_secs=0.2,
+            stop_secs=0.4,
             min_volume=0.0,
         )
     )

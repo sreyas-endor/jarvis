@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from pathlib import Path
 
 from pipecat.frames.frames import (
@@ -50,10 +51,9 @@ from .streaming import ClaudeStreamingProcess
 
 log = logging.getLogger(__name__)
 
-# File + shell + agent tools. Deliberately excludes WebFetch/WebSearch and
-# MCP — those add network egress or unknown third-party side effects that
-# can't be confirmed before execution (voice permission prompts are not
-# yet wired; every listed tool auto-runs).
+# File + shell + agent tools. Excludes WebFetch/WebSearch and MCP — those
+# add network egress or unknown third-party side effects that aren't worth
+# the voice-prompt overhead.
 DEFAULT_TOOLS: list[str] = [
     "Read",
     "Glob",
@@ -65,6 +65,26 @@ DEFAULT_TOOLS: list[str] = [
     "Task",
     "TodoWrite",
 ]
+
+# Read-only / harmless tools — run without asking. Anything else in
+# DEFAULT_TOOLS triggers a voice permission prompt before claude executes.
+DEFAULT_ALLOWED_TOOLS: list[str] = [
+    "Read",
+    "Glob",
+    "Grep",
+    "TodoWrite",
+]
+
+# How long we wait for a yes/no after asking. If the user is silent the
+# request is denied — better than leaving claude blocked forever and
+# wedging the call.
+PERMISSION_RESPONSE_TIMEOUT_SECONDS: float = 30.0
+
+# Regex-based yes/no parser for the user's spoken reply. Match the start
+# of the utterance — "yes please" → yes, "no don't" → no. Ambiguous
+# replies fall through and re-prompt once.
+_YES_RE = "^(yes|yeah|yep|sure|go|allow|do it|approved?|okay|ok)\\b"
+_NO_RE = "^(no|nope|nah|deny|stop|cancel|don'?t|negative)\\b"
 
 # Spoken filler phrases injected on the first ToolUseStart per turn so the
 # user hears Jarvis acknowledging work instead of dead air during the
@@ -160,14 +180,29 @@ HEARTBEAT_FILLERS: list[str] = [
 
 HEARTBEAT_INTERVAL_SECONDS: float = 10.0
 
+# Immediate acknowledgement spoken the moment we receive a transcription,
+# before claude has even seen the message. Cuts perceived latency: instead
+# of waiting ~2s in dead air for claude's TTFT + TTS startup, the user hears
+# us responding within ~200ms. Picked to be short, low-pitched, and sound
+# like a real "I'm listening" backchannel rather than canned filler.
+ACK_FILLERS: list[str] = [
+    "mhm…",
+    "yeah…",
+    "okay…",
+    "got it…",
+    "right…",
+    "hmm…",
+]
+
 
 class ClaudeCodeLLMService(LLMService):
     def __init__(
         self,
         *,
         workspace: Path,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-haiku-4-5",
         tools: list[str] | None = None,
+        allowed_tools: list[str] | None = None,
         add_dirs: list[Path] | None = None,
     ) -> None:
         # Claude Code owns generation parameters (model, temperature, system prompt, etc.)
@@ -187,10 +222,17 @@ class ClaudeCodeLLMService(LLMService):
             user_turn_completion_config=None,
         )
         super().__init__(settings=settings)
+        # permission-mode=default makes claude actually emit control_request
+        # for tools that aren't in allowed_tools, so we can voice-prompt the
+        # user.
         self._proc = ClaudeStreamingProcess(
             model=model,
             workspace=workspace,
             tools=tools if tools is not None else DEFAULT_TOOLS,
+            allowed_tools=(
+                allowed_tools if allowed_tools is not None else DEFAULT_ALLOWED_TOOLS
+            ),
+            permission_mode="default",
             add_dirs=add_dirs,
         )
         self._started = False
@@ -200,6 +242,13 @@ class ClaudeCodeLLMService(LLMService):
         self._awaiting_response = False  # sent to claude, waiting for its Start
         self._filler_injected_this_turn = False
         self._heartbeat_task: asyncio.Task | None = None
+
+        # Permission gating: when claude requests permission for an
+        # unlisted tool, we set _pending_permission to the request_id and
+        # speak the prompt. The next non-empty TranscriptionFrame is parsed
+        # as yes/no rather than forwarded as a user message.
+        self._pending_permission: PermissionRequest | None = None
+        self._permission_timeout_task: asyncio.Task | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -225,10 +274,30 @@ class ClaudeCodeLLMService(LLMService):
             return
 
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            text = frame.text.strip()
+            # If claude is blocked waiting on a permission decision, this
+            # utterance is the user's yes/no — route it there instead of
+            # treating it as a new chat message.
+            if self._pending_permission is not None:
+                self._suppress_text_until_next_send = False
+                await self._handle_permission_reply(text)
+                return
+
             await self._ensure_started()
             self._suppress_text_until_next_send = False
             self._awaiting_response = True
-            await self._proc.send_user(frame.text.strip())
+            # Speak the ack *before* sending to claude so the user hears
+            # "mhm…" within ~200ms of finishing their utterance instead of
+            # waiting for the model's TTFT. TTSSpeakFrame bypasses the
+            # sentence aggregator (see _maybe_inject_filler) so it
+            # synthesizes as an independent utterance.
+            await self.push_frame(
+                TTSSpeakFrame(
+                    text=random.choice(ACK_FILLERS),
+                    append_to_context=False,
+                )
+            )
+            await self._proc.send_user(text)
             return
 
         await self.push_frame(frame, direction)
@@ -253,10 +322,7 @@ class ClaudeCodeLLMService(LLMService):
                     log.info("claude tool use start: %s", item.name)
                     await self._maybe_inject_filler(item.name)
                 elif isinstance(item, PermissionRequest):
-                    log.warning(
-                        "permission requested for %s (auto-deny; voice prompt TBD)",
-                        item.tool,
-                    )
+                    await self._handle_permission_request(item)
                 elif isinstance(item, TurnComplete):
                     log.info("turn complete: stop=%s", item.stop_reason)
                     self._filler_injected_this_turn = False
@@ -332,8 +398,123 @@ class ClaudeCodeLLMService(LLMService):
         except Exception:
             log.exception("heartbeat loop crashed")
 
+    async def _handle_permission_request(self, req: PermissionRequest) -> None:
+        """Speak the prompt + arm yes/no routing for the next transcription."""
+        # If another prompt is already in flight, auto-deny the new one.
+        # Better than queueing — the user only tracks one thing at a time on
+        # a call.
+        if self._pending_permission is not None:
+            log.warning(
+                "received permission request for %s while already waiting on %s; auto-denying",
+                req.tool,
+                self._pending_permission.tool,
+            )
+            await self._proc.send_control_response(
+                req.request_id, allow=False, message="busy with another prompt"
+            )
+            return
+
+        self._pending_permission = req
+        # Heartbeat would step on the prompt — cancel it. Tool filler flag
+        # cleared so the next genuine tool start can still announce itself.
+        self._cancel_heartbeat()
+        self._filler_injected_this_turn = True
+
+        prompt = self._format_permission_prompt(req)
+        log.info("voice permission prompt: %s", prompt)
+        await self.push_frame(TTSSpeakFrame(text=prompt, append_to_context=False))
+
+        # Safety net so a silent user doesn't strand claude.
+        self._permission_timeout_task = asyncio.create_task(
+            self._permission_timeout()
+        )
+
+    def _format_permission_prompt(self, req: PermissionRequest) -> str:
+        """Tool-specific phrasing. Keep it short — the user's on a call."""
+        tool = req.tool
+        args = req.args or {}
+        if tool in ("Edit", "Write", "NotebookEdit"):
+            target = args.get("file_path") or args.get("notebook_path") or "a file"
+            verb = "edit" if tool == "Edit" else "write to"
+            return f"I want to {verb} {self._friendly_path(target)}. Okay?"
+        if tool == "Bash":
+            cmd = (args.get("command") or "").strip()
+            if len(cmd) > 80:
+                cmd = cmd[:77] + "…"
+            return f"I want to run: {cmd}. Okay?"
+        if tool == "Task":
+            return "I want to spin up a subagent. Okay?"
+        return f"I want to use the {tool} tool. Okay?"
+
+    @staticmethod
+    def _friendly_path(p: str) -> str:
+        """Strip workspace dirs and read out just a tail path."""
+        # Path is read out by TTS, so prefer short — keep just the last two
+        # segments which is usually enough to disambiguate.
+        parts = [s for s in p.split("/") if s]
+        return "/".join(parts[-2:]) if len(parts) > 2 else p
+
+    async def _permission_timeout(self) -> None:
+        try:
+            await asyncio.sleep(PERMISSION_RESPONSE_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        req = self._pending_permission
+        if req is None:
+            return
+        log.warning("permission prompt timed out for %s; denying", req.tool)
+        self._pending_permission = None
+        await self.push_frame(
+            TTSSpeakFrame(text="No answer — skipping that.", append_to_context=False)
+        )
+        await self._proc.send_control_response(
+            req.request_id, allow=False, message="user did not respond"
+        )
+
+    async def _handle_permission_reply(self, text: str) -> None:
+        """Parse a yes/no out of the user's reply and forward the verdict."""
+        req = self._pending_permission
+        if req is None:
+            return  # raced with timeout — nothing to do
+        lower = text.lower().strip()
+        if re.match(_YES_RE, lower):
+            allow = True
+        elif re.match(_NO_RE, lower):
+            allow = False
+        else:
+            # Ambiguous reply — re-prompt once. Treat the user's words as
+            # extra context to feed claude on the next turn if they keep
+            # ducking the question; for now just ask again.
+            log.info("ambiguous permission reply %r; re-prompting", text)
+            await self.push_frame(
+                TTSSpeakFrame(
+                    text="Sorry — yes or no?",
+                    append_to_context=False,
+                )
+            )
+            return
+
+        self._pending_permission = None
+        if self._permission_timeout_task and not self._permission_timeout_task.done():
+            self._permission_timeout_task.cancel()
+        self._permission_timeout_task = None
+        await self._proc.send_control_response(req.request_id, allow=allow)
+        # Short verbal acknowledgement so the user knows their reply landed,
+        # then claude's next stream emits whatever it does post-decision.
+        await self.push_frame(
+            TTSSpeakFrame(
+                text="okay" if allow else "skipping that",
+                append_to_context=False,
+            )
+        )
+
     async def cleanup(self) -> None:
         self._cancel_heartbeat()
+        if (
+            self._permission_timeout_task is not None
+            and not self._permission_timeout_task.done()
+        ):
+            self._permission_timeout_task.cancel()
         if self._event_task is not None and not self._event_task.done():
             self._event_task.cancel()
             try:
