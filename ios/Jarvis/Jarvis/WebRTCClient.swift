@@ -32,11 +32,35 @@ final class WebRTCClient: NSObject {
     var onConnectionStateChange: ((String) -> Void)?
 
     /// CallKit gives us a configured AVAudioSession. Tell RTCAudioSession the
-    /// system session is now active so it routes capture/playback through it.
+    /// system session is now active, then re-apply the category with our
+    /// preferred output routing: AirPods/Bluetooth when present, otherwise
+    /// the iPhone loudspeaker (not the small earpiece receiver, which is
+    /// what voiceChat mode picks by default on a real phone call).
     static func activateAudioSession(_ audioSession: AVAudioSession) {
         let rtcSession = RTCAudioSession.sharedInstance()
         rtcSession.lockForConfiguration()
         rtcSession.audioSessionDidActivate(audioSession)
+        do {
+            // .defaultToSpeaker = route to the loudspeaker when nothing
+            // else is connected. AirPods / wired headset / car Bluetooth
+            // take precedence automatically via the AVAudioSession
+            // route picker. videoChat mode (not voiceChat) keeps the
+            // category from forcing the small receiver — voiceChat tells
+            // iOS "phone call" semantics, which on real phones pins the
+            // earpiece even with .defaultToSpeaker set. videoChat keeps
+            // the AEC/AGC but lets the speaker route win.
+            try rtcSession.setCategory(
+                AVAudioSession.Category.playAndRecord,
+                mode: AVAudioSession.Mode.videoChat,
+                options: [
+                    .allowBluetooth,
+                    .allowBluetoothA2DP,
+                    .defaultToSpeaker,
+                ]
+            )
+        } catch {
+            print("audio session category configure failed: \(error)")
+        }
         rtcSession.isAudioEnabled = true
         rtcSession.unlockForConfiguration()
     }
@@ -46,6 +70,27 @@ final class WebRTCClient: NSObject {
         rtcSession.lockForConfiguration()
         rtcSession.isAudioEnabled = false
         rtcSession.audioSessionDidDeactivate(audioSession)
+        rtcSession.unlockForConfiguration()
+    }
+
+    /// Mute or unmute the local mic. Cheaper than toggling the audio
+    /// session — we just flip the track's isEnabled flag, which keeps
+    /// the SRTP path open and avoids re-negotiating WebRTC state.
+    func setMuted(_ muted: Bool) {
+        localAudioTrack?.isEnabled = !muted
+    }
+
+    /// Flip between hands-free loudspeaker and the default route (earpiece
+    /// when nothing is plugged in, AirPods / wired headset when they are).
+    /// Mirrors the Speaker button in the iOS phone-call UI.
+    static func setSpeakerphone(enabled: Bool) {
+        let rtcSession = RTCAudioSession.sharedInstance()
+        rtcSession.lockForConfiguration()
+        do {
+            try rtcSession.overrideOutputAudioPort(enabled ? .speaker : .none)
+        } catch {
+            print("overrideOutputAudioPort failed: \(error)")
+        }
         rtcSession.unlockForConfiguration()
     }
 

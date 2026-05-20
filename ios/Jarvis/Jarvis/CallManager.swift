@@ -16,6 +16,8 @@ import Foundation
 final class CallManager: NSObject, ObservableObject {
     @Published var statusText: String = "Tap to call Jarvis."
     @Published var isInCall: Bool = false
+    @Published var speakerOn: Bool = false
+    @Published var muted: Bool = false
 
     private let provider: CXProvider
     private let callController = CXCallController()
@@ -64,6 +66,22 @@ final class CallManager: NSObject, ObservableObject {
         callController.request(transaction) { _ in }
     }
 
+    func toggleSpeaker() {
+        let newValue = !speakerOn
+        WebRTCClient.setSpeakerphone(enabled: newValue)
+        DispatchQueue.main.async {
+            self.speakerOn = newValue
+        }
+    }
+
+    func toggleMute() {
+        let newValue = !muted
+        webRTC?.setMuted(newValue)
+        DispatchQueue.main.async {
+            self.muted = newValue
+        }
+    }
+
     private func teardown(reason: String) {
         webRTC?.close()
         webRTC = nil
@@ -71,6 +89,8 @@ final class CallManager: NSObject, ObservableObject {
         pendingServerURL = nil
         DispatchQueue.main.async {
             self.isInCall = false
+            self.speakerOn = false
+            self.muted = false
             self.statusText = reason
         }
     }

@@ -27,6 +27,36 @@ struct ContentView: View {
             }
 
             if callManager.isInCall {
+                HStack(spacing: 10) {
+                    Button {
+                        callManager.toggleMute()
+                    } label: {
+                        Label(
+                            callManager.muted ? "Muted" : "Mic on",
+                            systemImage: callManager.muted ? "mic.slash.fill" : "mic.fill"
+                        )
+                        .font(.title3.bold())
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(callManager.muted ? .orange : .gray)
+
+                    Button {
+                        callManager.toggleSpeaker()
+                    } label: {
+                        Label(
+                            callManager.speakerOn ? "Speaker on" : "Speaker off",
+                            systemImage: callManager.speakerOn ? "speaker.wave.3.fill" : "speaker.slash.fill"
+                        )
+                        .font(.title3.bold())
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(callManager.speakerOn ? .blue : .gray)
+                }
+
                 Button(role: .destructive) {
                     callManager.endCall()
                 } label: {
